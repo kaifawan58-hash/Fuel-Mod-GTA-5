@@ -26,6 +26,7 @@ using GTA.Native;
 using GTA.UI;
 using Font = GTA.UI.Font;
 using Control = GTA.Control;
+using Screen = GTA.UI.Screen;
 
 namespace SaifFuelMod
 {
