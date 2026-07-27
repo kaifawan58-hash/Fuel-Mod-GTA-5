@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>SaifFuelMod</AssemblyName>
+    <RootNamespace>SaifFuelMod</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pulled automatically from NuGet during the cloud build - no manual download needed -->
+    <PackageReference Include="ScriptHookVDotNet3" Version="3.6.0" />
+  </ItemGroup>
+
+</Project>
