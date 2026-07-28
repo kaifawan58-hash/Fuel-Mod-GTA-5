@@ -8,7 +8,7 @@
 //  - F stores the current vehicle's fuel into one of 4 remembered slots (so
 //    up to 4 vehicles keep independent fuel levels, cycling slot each press).
 //  - Out of fuel -> H calls emergency fuel delivery for an extra fee.
-//  - Ctrl+Shift+C opens a runtime config menu (rates, prices) with the same
+//  - F7 opens a runtime config menu (rates, prices) with the same
 //    W/S/A/D/E controls, saved to disk.
 // Real per-machine station coordinates, dynamic hour-of-day pricing,
 // permanent speedometer, ambient refuelling traffic, and save/load are kept
@@ -39,6 +39,10 @@ namespace SaifFuelMod
         {
             public string Name;
             public Dictionary<string, Vector3> Machines = new Dictionary<string, Vector3>();
+            public bool IsMountain;           // region - affects price band
+            public float RegionPriceMult = 1f; // randomized once per station
+            public bool OutOfStock;
+            public DateTime OutOfStockUntil = DateTime.MinValue;
         }
 
         private readonly List<Station> _stations = new List<Station>();
@@ -49,6 +53,19 @@ namespace SaifFuelMod
             {
                 var s = new Station { Name = name };
                 foreach (var m in machines) s.Machines[m.type] = new Vector3(m.x, m.y, m.z);
+
+                // Mountain/rural stations (higher elevation) cost more than city ones,
+                // and each station gets its own small random variance so no two
+                // stations are ever priced exactly the same - like the reference mod's
+                // per-pump price fluctuation.
+                float avgZ = 0f;
+                foreach (var mv in s.Machines.Values) avgZ += mv.Z;
+                avgZ /= Math.Max(1, s.Machines.Count);
+                s.IsMountain = avgZ > 90f;
+                s.RegionPriceMult = s.IsMountain
+                    ? 1.10f + (float)Rand.NextDouble() * 0.20f   // 1.10x - 1.30x out in the hills
+                    : 0.95f + (float)Rand.NextDouble() * 0.15f;  // 0.95x - 1.10x in the city
+
                 _stations.Add(s);
             }
 
@@ -112,7 +129,7 @@ namespace SaifFuelMod
         }
 
         // =================================================================
-        // RUNTIME CONFIG (editable in-game via Ctrl+Shift+C, mirrors the
+        // RUNTIME CONFIG (editable in-game via F7, mirrors the
         // original's tunable "benfcrate/benocrate/benfspe/..." values)
         // =================================================================
         private float _fuelConsumeRate = 1.0f;      // multiplier on base burn rate
@@ -146,10 +163,6 @@ namespace SaifFuelMod
         // 4-slot "remember this vehicle's fuel" system (mirrors ingatsatu/ingatdua/
         // ingattiga/ingatempat in the original) - lets up to 4 vehicles keep
         // independently tracked fuel without needing the plate save file.
-        private class RememberedVehicle { public int ModelHash; public string Plate; public float Fuel; }
-        private readonly RememberedVehicle[] _remembered = new RememberedVehicle[4];
-        private int _rememberCursor = 0;
-
         private int _money = 5000;
 
         // =================================================================
@@ -167,11 +180,19 @@ namespace SaifFuelMod
         private float _jobTargetFuel = 0f;
 
         // =================================================================
-        // CONFIG MENU STATE (Ctrl+Shift+C opens, same W/S/A/D/E/Q controls)
+        // CONFIG MENU STATE (F7 opens, W/S/A/D/E/Q controls)
         // =================================================================
         private bool _configOpen = false;
         private int _configIndex = 0;
-        private const int CONFIG_ITEM_COUNT = 8;
+        private const int CONFIG_ITEM_COUNT = 12;
+
+        // HUD customization - editable from the F7 settings menu
+        private enum HudStyle { VerticalBar, DigitalPercent }
+        private HudStyle _hudStyle = HudStyle.VerticalBar;
+        private enum HudCorner { BottomLeft, BottomRight, TopLeft, TopRight }
+        private HudCorner _hudCorner = HudCorner.BottomLeft;
+        private float _hudScale = 1.0f; // 0.6 - 1.6
+        private const string HudConfigPath = "scripts\\SaifFuelMod_hud.txt";
 
         private static readonly Random Rand = new Random();
 
@@ -180,6 +201,14 @@ namespace SaifFuelMod
         private const int AMBIENT_TARGET_COUNT = 3;
         private DateTime _lastAmbientCheck = DateTime.MinValue;
 
+        // temporary consumption discount granted after an emergency H fuel call
+        private DateTime _slowConsumptionUntil = DateTime.MinValue;
+
+        // Fuel theft - walk up to a parked vehicle and a panel appears on its own
+        // (same as the pump panel), Numpad5 confirms. No dedicated key.
+        private bool _theftMenuOpen = false;
+        private Vehicle _theftTarget = null;
+
         private bool _stationsSpawned = false;
 
         public FuelMod()
@@ -187,14 +216,15 @@ namespace SaifFuelMod
             BuildStations();
             LoadSaveData();
             LoadConfig();
+            LoadHudConfig();
 
             Tick += OnTick;
             KeyDown += OnKeyDown;
             Aborted += (s, e) => SaveData();
 
             Notification.Show("~g~Saif Fuel Mod~w~ loaded.");
-            Notification.Show("~y~Approach a pump, press ~b~E~y~ for the service menu.");
-            Notification.Show("~y~X~w~=radio  ~y~F~w~=remember vehicle fuel  ~y~H~w~=emergency fuel  ~y~Ctrl+Shift+C~w~=settings");
+            Notification.Show("~y~Approach a pump~w~ - the panel opens on its own, ~b~Numpad5~y~ confirms.");
+            Notification.Show("~y~X~w~=radio  ~y~H~w~=emergency full tank  ~y~F7~w~=settings/HUD customize");
         }
 
         // =================================================================
@@ -217,19 +247,36 @@ namespace SaifFuelMod
 
                 CheckVehicleSwitch();
                 UpdateFuelAndOilDrain();
+                AutoRememberFuel();
                 UpdateHud();
+                UpdateStationStock();
                 UpdatePumpProximity();
+                UpdateTheftProximity();
                 UpdateActiveJob();
                 UpdateEmergencyFuel();
                 UpdateAmbientVehicles();
 
-                if (_menuOpen) DrawMenu();
                 if (_configOpen) DrawConfigMenu();
             }
             catch (Exception ex)
             {
                 Log("OnTick error: " + ex.Message);
             }
+        }
+
+        // Continuously keeps this vehicle's fuel/oil remembered - no need to
+        // press a key. Cheap in-memory update every tick; the on-disk file is
+        // only written on job completion / vehicle switch / exit (see SaveData).
+        private void AutoRememberFuel()
+        {
+            Ped playerPed = Game.Player.Character;
+            if (!playerPed.IsInVehicle()) return;
+            Vehicle veh = playerPed.CurrentVehicle;
+            if (veh == null || !veh.Exists()) return;
+
+            string plate = Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, veh);
+            if (string.IsNullOrEmpty(plate)) return;
+            _savedByPlate[plate] = new[] { _fuel, _engineOil, _transOil };
         }
 
         private void CreateStationBlips(Station st)
@@ -264,6 +311,9 @@ namespace SaifFuelMod
                 if (veh.ClassType == VehicleClass.Sports || veh.ClassType == VehicleClass.Super) modifier *= 1.2f;
                 if (veh.EngineHealth < 700f) modifier *= 1.3f;
                 modifier = Math.Min(modifier, 1.8f) * _fuelConsumeRate;
+
+                // reward for calling emergency fuel - burns slower for a while afterward
+                if (DateTime.Now < _slowConsumptionUntil) modifier *= 0.5f;
 
                 float litresPerSecond = (8.4f / 100f) * modifier;
                 _fuel = Math.Max(0f, _fuel - litresPerSecond * Game.LastFrameTime);
@@ -307,11 +357,12 @@ namespace SaifFuelMod
             if (!_outOfFuelEmergencyPending) return;
             if (DateTime.Now < _emergencyArrival) return;
 
-            _fuel = _maxFuel * 0.5f;
+            _fuel = _maxFuel; // full tank, not just half
+            _slowConsumptionUntil = DateTime.Now.AddMinutes(3); // burns at half rate for 3 minutes as a bonus
             _outOfFuelEmergencyPending = false;
             Ped playerPed = Game.Player.Character;
             if (playerPed.IsInVehicle()) playerPed.CurrentVehicle.IsEngineRunning = false; // still needs restarting manually
-            Notification.Show("~g~Emergency fuel delivered!~w~ Half a tank added.");
+            Notification.Show("~g~Emergency fuel delivered!~w~ Full tank + slower burn rate for 3 minutes.");
         }
 
         private void TryCallEmergencyFuel()
@@ -345,7 +396,7 @@ namespace SaifFuelMod
             return 1.00f;
         }
 
-        private float GetFuelPrice(string fuelType)
+        private float GetFuelPrice(string fuelType, Station station = null)
         {
             int hour = Function.Call<int>(Hash.GET_CLOCK_HOURS);
             float mult = HourMultiplier(hour);
@@ -353,6 +404,9 @@ namespace SaifFuelMod
             if (DateTime.Now.DayOfWeek == DayOfWeek.Saturday || DateTime.Now.DayOfWeek == DayOfWeek.Sunday) mult *= 1.03f;
             if (World.Weather == Weather.Raining || World.Weather == Weather.ThunderStorm) mult *= 1.08f;
             if (Rand.Next(1000) < 2) mult *= 1.25f;
+
+            // city vs mountain region price band, randomized per-station at load
+            if (station != null) mult *= station.RegionPriceMult;
 
             switch (fuelType)
             {
@@ -396,18 +450,28 @@ namespace SaifFuelMod
             return "Regular";
         }
 
+        // Shows the styled service panel automatically as soon as you're near the
+        // correct machine - no separate "open" key needed, matching the reference
+        // layout where the panel is just always there while you're at the pump.
         private void UpdatePumpProximity()
         {
-            if (_menuOpen || _configOpen || _activeJob != ActiveJob.None) return;
+            if (_configOpen || _activeJob != ActiveJob.None) return;
             Ped playerPed = Game.Player.Character;
-            if (!playerPed.IsInVehicle()) { _nearStation = null; return; }
+            if (!playerPed.IsInVehicle()) { _nearStation = null; _menuOpen = false; return; }
             Vehicle veh = playerPed.CurrentVehicle;
-            if (veh == null || veh.Driver != playerPed || veh.Speed > 1.0f) { _nearStation = null; return; }
+            if (veh == null || veh.Driver != playerPed || veh.Speed > 1.0f) { _nearStation = null; _menuOpen = false; return; }
 
             var (station, type, pos) = FindNearbyMachine(veh.Position, 6f);
             _nearStation = station;
             _nearFuelType = type;
-            if (station == null) return;
+            if (station == null) { _menuOpen = false; return; }
+
+            if (station.OutOfStock)
+            {
+                Screen.ShowSubtitle($"~r~{station.Name}~w~\nOut of fuel right now - try another station.", 60);
+                _menuOpen = false;
+                return;
+            }
 
             string required = GetRequiredFuelType(veh);
             if (type != required)
@@ -416,26 +480,103 @@ namespace SaifFuelMod
                 string audience = type == "Electric" ? "Hybrids" : type == "Diesel" ? "Diesel vehicles" :
                                    type == "Premium" ? "Sports/Super cars" : "Regular vehicles";
                 Screen.ShowSubtitle($"~r~{type.ToUpper()} PUMP~w~\nThis pump is for {audience} only", 60);
+                _menuOpen = false;
                 return;
             }
 
-            Screen.ShowHelpText(
-                $"Press ~INPUT_CONTEXT~ for the service menu at {station.Name}\n{type}: ~g~${GetFuelPrice(type):F2}~w~/L",
-                100, false, false);
+            if (!_menuOpen)
+            {
+                _menuOpen = true;
+                _menuIndex = 0;
+                _fuelRequested = Math.Min(20f, Math.Max(0f, _maxFuel - _fuel));
+            }
+            DrawMenu();
         }
 
-        private void OpenMenu()
+        // Randomly takes a station out of stock for a while, and brings expired
+        // ones back - checked periodically, not every tick.
+        private DateTime _lastStockCheck = DateTime.MinValue;
+        private void UpdateStationStock()
         {
-            if (_nearStation == null) { Notification.Show("~r~Not near a fuel pump!"); return; }
-            Vehicle veh = Game.Player.Character.CurrentVehicle;
-            if (veh != null && _nearFuelType != GetRequiredFuelType(veh))
+            if ((DateTime.Now - _lastStockCheck).TotalSeconds < 30) return;
+            _lastStockCheck = DateTime.Now;
+
+            foreach (var st in _stations)
             {
-                Notification.Show($"~r~Wrong pump!~w~ Your vehicle needs {GetRequiredFuelType(veh)}.");
-                return;
+                if (st.OutOfStock && DateTime.Now >= st.OutOfStockUntil)
+                {
+                    st.OutOfStock = false;
+                }
+                else if (!st.OutOfStock && Rand.Next(1000) < 3) // small chance per 30s check
+                {
+                    st.OutOfStock = true;
+                    st.OutOfStockUntil = DateTime.Now.AddMinutes(2 + Rand.Next(6));
+                }
             }
-            _menuOpen = true;
-            _menuIndex = 0;
-            _fuelRequested = Math.Min(20f, Math.Max(0f, _maxFuel - _fuel));
+        }
+
+        // =================================================================
+        // FUEL THEFT - walk up to a parked vehicle, a panel appears on its own
+        // (same idea as the pump panel), Numpad5 siphons some fuel into your
+        // tank. No dedicated key, just proximity + the existing confirm key.
+        // =================================================================
+        private void UpdateTheftProximity()
+        {
+            if (_menuOpen || _configOpen || _activeJob != ActiveJob.None) { _theftMenuOpen = false; return; }
+            Ped playerPed = Game.Player.Character;
+            if (playerPed.IsInVehicle()) { _theftMenuOpen = false; return; }
+
+            Vehicle nearest = null;
+            float bestDist = 3.0f;
+            foreach (Vehicle v in World.GetNearbyVehicles(playerPed.Position, 3.0f))
+            {
+                if (v == null || !v.Exists()) continue;
+                if (v == playerPed.CurrentVehicle) continue;
+                if (v.Driver != null && v.Driver.Exists() && !v.Driver.IsDead) continue; // don't rob a driven vehicle
+                float d = v.Position.DistanceTo(playerPed.Position);
+                if (d < bestDist) { bestDist = d; nearest = v; }
+            }
+
+            if (nearest == null) { _theftMenuOpen = false; _theftTarget = null; return; }
+
+            _theftTarget = nearest;
+            _theftMenuOpen = true;
+            DrawTheftMenu();
+        }
+
+        private void DrawTheftMenu()
+        {
+            float x = 60f, y = 200f;
+            new ContainerElement(new PointF(x - 15, y - 70), new SizeF(320, 120), Color.FromArgb(230, 15, 15, 15)).Draw();
+            new ContainerElement(new PointF(x - 15, y - 70), new SizeF(320, 34), Color.FromArgb(255, 150, 40, 40)).Draw();
+            new TextElement("SIPHON FUEL", new PointF(x, y - 65), 0.32f, Color.White, Font.ChaletLondon).Draw();
+            new TextElement("[x] Siphon ~5-15L from this vehicle", new PointF(x, y - 20), 0.26f, Color.FromArgb(255, 255, 220, 220), Font.ChaletLondon).Draw();
+            new TextElement("Numpad 5: confirm (risky - may draw attention)", new PointF(x, y + 10), 0.2f, Color.LightGray, Font.ChaletLondon).Draw();
+        }
+
+        private void ConfirmTheft()
+        {
+            if (_theftTarget == null || !_theftTarget.Exists()) { _theftMenuOpen = false; return; }
+
+            float stolen = 5f + (float)Rand.NextDouble() * 10f;
+            float space = _maxFuel - _fuel;
+            stolen = Math.Min(stolen, Math.Max(0f, space));
+
+            if (stolen <= 0.2f) { Notification.Show("~y~Your tank is already full."); return; }
+
+            _fuel += stolen;
+            Notification.Show($"~g~Siphoned {stolen:F1}L~w~ of fuel. Keep an eye out.");
+
+            // small chance of getting noticed
+            if (Rand.Next(100) < 25)
+            {
+                Function.Call(Hash.SET_PLAYER_WANTED_LEVEL, Game.Player, 1, false);
+                Function.Call(Hash.SET_PLAYER_WANTED_LEVEL_NOW, Game.Player, false);
+                Notification.Show("~r~Someone saw you!");
+            }
+
+            _theftMenuOpen = false;
+            SaveData();
         }
 
         private void DrawMenu()
@@ -445,7 +586,7 @@ namespace SaifFuelMod
 
             (string label, float amount, float cost)[] items =
             {
-                ($"Fuel ({_nearFuelType})", _fuelRequested, _fuelRequested * GetFuelPrice(_nearFuelType)),
+                ($"Fuel ({_nearFuelType})", _fuelRequested, _fuelRequested * GetFuelPrice(_nearFuelType, _nearStation)),
                 ("Engine oil", ENGINE_OIL_MAX - _engineOil, (ENGINE_OIL_MAX - _engineOil) * ENGINE_OIL_PRICE_PER_UNIT),
                 ("Transmission oil", TRANS_OIL_MAX - _transOil, (TRANS_OIL_MAX - _transOil) * TRANS_OIL_PRICE_PER_UNIT),
                 ("Repair vehicle", 0, GetRepairCost(veh)),
@@ -475,18 +616,17 @@ namespace SaifFuelMod
             new ContainerElement(new PointF(x, totalY), new SizeF(330, 30), Color.FromArgb(255, 60, 180, 80)).Draw();
             new TextElement($"Total: ${total:F2}", new PointF(x + 10, totalY + 5), 0.3f, Color.Black, Font.ChaletLondon).Draw();
 
-            new TextElement("W/S move   A/D adjust fuel   E confirm   Q close", new PointF(x, totalY + 35), 0.2f, Color.LightGray, Font.ChaletLondon).Draw();
+            new TextElement("Numpad 8/2 move   4/6 adjust fuel   5 confirm", new PointF(x, totalY + 35), 0.2f, Color.LightGray, Font.ChaletLondon).Draw();
         }
 
         private void HandleMenuInput(Keys key)
         {
             int itemCount = 4;
-            if (key == Keys.W) _menuIndex = (_menuIndex - 1 + itemCount) % itemCount;
-            else if (key == Keys.S) _menuIndex = (_menuIndex + 1) % itemCount;
-            else if (key == Keys.A && _menuIndex == 0) _fuelRequested = Math.Max(5f, _fuelRequested - 5f);
-            else if (key == Keys.D && _menuIndex == 0) _fuelRequested = Math.Min(Math.Max(0f, _maxFuel - _fuel), _fuelRequested + 5f);
-            else if (key == Keys.Q) _menuOpen = false;
-            else if (key == Keys.E) ConfirmMenuSelection();
+            if (key == Keys.NumPad8) _menuIndex = (_menuIndex - 1 + itemCount) % itemCount;
+            else if (key == Keys.NumPad2) _menuIndex = (_menuIndex + 1) % itemCount;
+            else if (key == Keys.NumPad4 && _menuIndex == 0) _fuelRequested = Math.Max(5f, _fuelRequested - 5f);
+            else if (key == Keys.NumPad6 && _menuIndex == 0) _fuelRequested = Math.Min(Math.Max(0f, _maxFuel - _fuel), _fuelRequested + 5f);
+            else if (key == Keys.NumPad5) ConfirmMenuSelection();
         }
 
         private void ConfirmMenuSelection()
@@ -495,7 +635,7 @@ namespace SaifFuelMod
             {
                 case ServiceItem.Fuel:
                     if (_fuelRequested <= 0.5f) { Notification.Show("~y~Tank is already full."); return; }
-                    StartJob(ActiveJob.Refuel, _fuelRequested * GetFuelPrice(_nearFuelType), "Refueling");
+                    StartJob(ActiveJob.Refuel, _fuelRequested * GetFuelPrice(_nearFuelType, _nearStation), "Refueling");
                     break;
                 case ServiceItem.EngineOil:
                     float oilCost = (ENGINE_OIL_MAX - _engineOil) * ENGINE_OIL_PRICE_PER_UNIT;
@@ -568,40 +708,6 @@ namespace SaifFuelMod
         }
 
         // =================================================================
-        // 4-SLOT REMEMBERED VEHICLE FUEL (F key)
-        // =================================================================
-        private void RememberCurrentVehicle()
-        {
-            Ped playerPed = Game.Player.Character;
-            if (!playerPed.IsInVehicle()) { Notification.Show("~r~Get in a vehicle first!"); return; }
-            Vehicle veh = playerPed.CurrentVehicle;
-            string plate = Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, veh);
-
-            _remembered[_rememberCursor] = new RememberedVehicle
-            {
-                ModelHash = veh.Model.Hash,
-                Plate = plate,
-                Fuel = _fuel
-            };
-            Notification.Show($"~g~Remembered fuel for this vehicle~w~ (slot {_rememberCursor + 1}/4)");
-            _rememberCursor = (_rememberCursor + 1) % 4;
-        }
-
-        private bool TryRecallRememberedFuel(Vehicle veh, string plate, out float fuel)
-        {
-            foreach (var r in _remembered)
-            {
-                if (r != null && r.ModelHash == veh.Model.Hash && r.Plate == plate)
-                {
-                    fuel = r.Fuel;
-                    return true;
-                }
-            }
-            fuel = 0f;
-            return false;
-        }
-
-        // =================================================================
         // HUD - vertical fuel bar + speed track beside the minimap
         // =================================================================
         // Vertical segmented fuel bar docked right next to the minimap, with a
@@ -611,32 +717,56 @@ namespace SaifFuelMod
         private void UpdateHud()
         {
             const int SEGMENTS = 12;
-            float x = 285f, barTop = Screen.Height - 260f, barHeight = 220f;
-            float segGap = 3f, segHeight = (barHeight - segGap * (SEGMENTS - 1)) / SEGMENTS;
+            float baseBarHeight = 220f, baseWidth = 26f;
+            float barHeight = baseBarHeight * _hudScale;
+            float segW = baseWidth * _hudScale;
 
-            float fuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 0f;
-            int litSegments = (int)Math.Round(fuelPct * SEGMENTS);
-
-            new ContainerElement(new PointF(x - 6, barTop - 22), new SizeF(38, barHeight + 30), Color.FromArgb(150, 0, 0, 0)).Draw();
-            new TextElement("FUEL", new PointF(x - 2, barTop - 20), 0.22f, Color.White, Font.ChaletLondon).Draw();
-
-            for (int i = 0; i < SEGMENTS; i++)
+            // work out the anchor point for the chosen corner (fuel bar sits just
+            // beside the minimap when in a bottom corner, matching the reference)
+            float x, barTop;
+            switch (_hudCorner)
             {
-                bool lit = i >= (SEGMENTS - litSegments);
-                Color segColor = !lit ? Color.FromArgb(140, 40, 40, 40)
-                                 : fuelPct < 0.15f ? Color.Red
-                                 : fuelPct < 0.3f ? Color.Orange
-                                 : Color.LimeGreen;
-                float segY = barTop + i * (segHeight + segGap);
-                new ContainerElement(new PointF(x, segY), new SizeF(26, segHeight), segColor).Draw();
+                case HudCorner.BottomRight: x = Screen.Width - 60f; barTop = Screen.Height - 260f * _hudScale; break;
+                case HudCorner.TopLeft: x = 285f; barTop = 90f; break;
+                case HudCorner.TopRight: x = Screen.Width - 60f; barTop = 90f; break;
+                default: x = 285f; barTop = Screen.Height - 260f * _hudScale; break; // BottomLeft
             }
 
-            // small oil indicator underneath the fuel bar
+            float fuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 0f;
             float oilPct = _engineOil / ENGINE_OIL_MAX;
-            Color oilColor = oilPct < 0.3f ? Color.Red : Color.LimeGreen;
-            new TextElement("OIL", new PointF(x - 2, barTop + barHeight + 8), 0.2f, Color.White, Font.ChaletLondon).Draw();
-            new ContainerElement(new PointF(x, barTop + barHeight + 24), new SizeF(26, 8), Color.FromArgb(140, 60, 60, 60)).Draw();
-            new ContainerElement(new PointF(x, barTop + barHeight + 24), new SizeF(26 * oilPct, 8), oilColor).Draw();
+
+            if (_hudStyle == HudStyle.DigitalPercent)
+            {
+                new ContainerElement(new PointF(x - 6, barTop - 6), new SizeF(160 * _hudScale, 70 * _hudScale), Color.FromArgb(190, 0, 0, 0)).Draw();
+                Color fuelColor = fuelPct < 0.15f ? Color.Red : (fuelPct < 0.3f ? Color.Orange : Color.LimeGreen);
+                new TextElement($"FUEL {fuelPct * 100:F0}%", new PointF(x + 4, barTop), 0.3f * _hudScale, fuelColor, Font.ChaletLondon).Draw();
+                Color oilColorD = oilPct < 0.3f ? Color.Red : Color.LimeGreen;
+                new TextElement($"OIL {oilPct * 100:F0}%", new PointF(x + 4, barTop + 30 * _hudScale), 0.26f * _hudScale, oilColorD, Font.ChaletLondon).Draw();
+            }
+            else
+            {
+                float segGap = 3f, segHeight = (barHeight - segGap * (SEGMENTS - 1)) / SEGMENTS;
+                int litSegments = (int)Math.Round(fuelPct * SEGMENTS);
+
+                new ContainerElement(new PointF(x - 6, barTop - 22), new SizeF(segW + 12, barHeight + 30), Color.FromArgb(150, 0, 0, 0)).Draw();
+                new TextElement("FUEL", new PointF(x - 2, barTop - 20), 0.22f, Color.White, Font.ChaletLondon).Draw();
+
+                for (int i = 0; i < SEGMENTS; i++)
+                {
+                    bool lit = i >= (SEGMENTS - litSegments);
+                    Color segColor = !lit ? Color.FromArgb(140, 40, 40, 40)
+                                     : fuelPct < 0.15f ? Color.Red
+                                     : fuelPct < 0.3f ? Color.Orange
+                                     : Color.LimeGreen;
+                    float segY = barTop + i * (segHeight + segGap);
+                    new ContainerElement(new PointF(x, segY), new SizeF(segW, segHeight), segColor).Draw();
+                }
+
+                Color oilColor = oilPct < 0.3f ? Color.Red : Color.LimeGreen;
+                new TextElement("OIL", new PointF(x - 2, barTop + barHeight + 8), 0.2f, Color.White, Font.ChaletLondon).Draw();
+                new ContainerElement(new PointF(x, barTop + barHeight + 24), new SizeF(segW, 8), Color.FromArgb(140, 60, 60, 60)).Draw();
+                new ContainerElement(new PointF(x, barTop + barHeight + 24), new SizeF(segW * oilPct, 8), oilColor).Draw();
+            }
 
             // Speed track - a vertical line beside the fuel bar; the marker slides
             // up toward the top as speed approaches the vehicle's top speed.
@@ -645,7 +775,7 @@ namespace SaifFuelMod
             Vehicle veh = playerPed.CurrentVehicle;
             if (veh == null || !veh.Exists()) return;
 
-            float trackX = x + 40f;
+            float trackX = x + segW + 14f;
             new ContainerElement(new PointF(trackX, barTop), new SizeF(2, barHeight), Color.FromArgb(160, 220, 220, 220)).Draw();
 
             float maxSpeed = Function.Call<float>(Hash.GET_VEHICLE_MODEL_ESTIMATED_MAX_SPEED, veh.Model.Hash);
@@ -660,13 +790,13 @@ namespace SaifFuelMod
         }
 
         // =================================================================
-        // RUNTIME CONFIG MENU (Ctrl+Shift+C)
+        // RUNTIME CONFIG MENU (F7)
         // =================================================================
         private void ToggleConfigMenu()
         {
             _configOpen = !_configOpen;
             _configIndex = 0;
-            if (!_configOpen) SaveConfig();
+            if (!_configOpen) { SaveConfig(); SaveHudConfig(); }
         }
 
         private void DrawConfigMenu()
@@ -682,6 +812,10 @@ namespace SaifFuelMod
                 $"Regular price: ${_priceRegular:F2}/L",
                 $"Diesel price: ${_priceDiesel:F2}/L",
                 $"Premium price: ${_pricePremium:F2}/L",
+                $"HUD style: {(_hudStyle == HudStyle.VerticalBar ? "Vertical Bar" : "Digital %")}",
+                $"HUD corner: {_hudCorner}",
+                $"HUD size: {_hudScale:F1}x",
+                "-- close: F7 again --",
             };
 
             new ContainerElement(new PointF(x - 10, y - 30), new SizeF(420, rowH * labels.Length + 50), Color.FromArgb(210, 0, 0, 0)).Draw();
@@ -692,7 +826,7 @@ namespace SaifFuelMod
                 Color c = i == _configIndex ? Color.Yellow : Color.White;
                 new TextElement(labels[i], new PointF(x, y + i * rowH), 0.26f, c, Font.ChaletLondon).Draw();
             }
-            new TextElement("W/S: move   A/D: adjust   Ctrl+Shift+C: save & close", new PointF(x, y + labels.Length * rowH + 15), 0.22f, Color.LightGray, Font.ChaletLondon).Draw();
+            new TextElement("W/S: move   A/D: adjust   F7: save & close", new PointF(x, y + labels.Length * rowH + 15), 0.22f, Color.LightGray, Font.ChaletLondon).Draw();
         }
 
         private void HandleConfigInput(Keys key)
@@ -715,6 +849,12 @@ namespace SaifFuelMod
                 case 5: _priceRegular = Clamp(_priceRegular + dir * 0.05f, 0.5f, 15f); break;
                 case 6: _priceDiesel = Clamp(_priceDiesel + dir * 0.05f, 0.5f, 15f); break;
                 case 7: _pricePremium = Clamp(_pricePremium + dir * 0.05f, 0.5f, 15f); break;
+                case 8: if (dir != 0) _hudStyle = _hudStyle == HudStyle.VerticalBar ? HudStyle.DigitalPercent : HudStyle.VerticalBar; break;
+                case 9:
+                    int corner = ((int)_hudCorner + dir + 4) % 4;
+                    _hudCorner = (HudCorner)corner;
+                    break;
+                case 10: _hudScale = Clamp(_hudScale + dir * 0.1f, 0.6f, 1.6f); break;
             }
         }
 
@@ -756,6 +896,32 @@ namespace SaifFuelMod
                 Notification.Show("~g~Settings saved!");
             }
             catch (Exception ex) { Log("Config save error: " + ex.Message); }
+        }
+
+        private void LoadHudConfig()
+        {
+            try
+            {
+                if (!File.Exists(HudConfigPath)) return;
+                var lines = File.ReadAllLines(HudConfigPath);
+                if (lines.Length >= 3)
+                {
+                    _hudStyle = lines[0] == "1" ? HudStyle.DigitalPercent : HudStyle.VerticalBar;
+                    _hudCorner = (HudCorner)int.Parse(lines[1]);
+                    _hudScale = float.Parse(lines[2]);
+                }
+            }
+            catch (Exception ex) { Log("HUD config load error: " + ex.Message); }
+        }
+
+        private void SaveHudConfig()
+        {
+            try
+            {
+                var lines = new[] { _hudStyle == HudStyle.DigitalPercent ? "1" : "0", ((int)_hudCorner).ToString(), _hudScale.ToString("F1") };
+                File.WriteAllLines(HudConfigPath, lines);
+            }
+            catch (Exception ex) { Log("HUD config save error: " + ex.Message); }
         }
 
         // =================================================================
@@ -851,11 +1017,7 @@ namespace SaifFuelMod
             string plate = Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, veh);
             _maxFuel = GetTankSize(veh);
 
-            if (TryRecallRememberedFuel(veh, plate, out float rememberedFuel))
-            {
-                _fuel = rememberedFuel;
-            }
-            else if (!string.IsNullOrEmpty(plate) && _savedByPlate.TryGetValue(plate, out float[] saved))
+            if (!string.IsNullOrEmpty(plate) && _savedByPlate.TryGetValue(plate, out float[] saved))
             {
                 _fuel = saved[0];
                 _engineOil = saved[1];
@@ -878,23 +1040,19 @@ namespace SaifFuelMod
         {
             try
             {
-                if (_configOpen)
-                {
-                    if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.ShiftKey) return;
-                    HandleConfigInput(e.KeyCode);
-                    return;
-                }
-                if (e.KeyCode == Keys.C && System.Windows.Forms.Control.ModifierKeys == (Keys.Control | Keys.Shift))
+                if (e.KeyCode == Keys.F7)
                 {
                     ToggleConfigMenu();
                     return;
                 }
 
+                if (_configOpen) { HandleConfigInput(e.KeyCode); return; }
+
                 if (_menuOpen) { HandleMenuInput(e.KeyCode); return; }
 
-                if (e.KeyCode == Keys.E && _activeJob == ActiveJob.None) OpenMenu();
-                else if (e.KeyCode == Keys.X) ToggleRadio();
-                else if (e.KeyCode == Keys.F) RememberCurrentVehicle();
+                if (_theftMenuOpen) { if (e.KeyCode == Keys.NumPad5) ConfirmTheft(); return; }
+
+                if (e.KeyCode == Keys.X) ToggleRadio();
                 else if (e.KeyCode == Keys.H) TryCallEmergencyFuel();
             }
             catch (Exception ex) { Log("OnKeyDown error: " + ex.Message); }
