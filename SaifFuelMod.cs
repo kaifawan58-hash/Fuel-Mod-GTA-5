@@ -150,7 +150,6 @@ namespace SaifFuelMod
         private float _hudOffsetX = 285f;
         private float _hudOffsetY = -260f; // negative = measured up from bottom of screen
         private float _hudScale = 1.0f;
-        // single simple digital HUD now - no more style choice
         private const string HudConfigPath = "scripts\\SaifFuelMod_hud.txt";
         private float _displayedFuelPct = 1f; // lerped toward the real value for a live-draining look
 
@@ -357,7 +356,6 @@ namespace SaifFuelMod
             SelectClosest(_hudScaleItem, _hudScale);
             _hudScaleItem.ItemChanged += (s, e) => _hudScale = _hudScaleItem.SelectedItem;
 
-
             _siphonItem = new NativeItem("Siphon Nearby Vehicle", "Fills your jerry can, not your tank directly.");
             _callDeliveryItem = new NativeItem("Call Fuel Delivery", $"${DELIVERY_COST} - a helicopter brings fuel to you.");
 
@@ -492,9 +490,7 @@ namespace SaifFuelMod
 
                 if (DateTime.Now < _slowConsumptionUntil) modifier *= 0.5f;
 
-                // was 6.5/100 (too slow, bar looked stuck) - bumped so the
-                // meter visibly moves during a normal drive
-                float litresPerSecond = (6.5f / 40f) * modifier;
+                float litresPerSecond = (6.5f / 100f) * modifier;
                 _fuel = Math.Max(0f, _fuel - litresPerSecond * Game.LastFrameTime);
 
                 float oilDrain = 0.03f * _oilConsumeRate * Game.LastFrameTime;
@@ -841,7 +837,7 @@ namespace SaifFuelMod
         private Vector3 _deliveryStartPos;
         private Vector3 _deliveryTargetPos;
         private float _deliveryFlightT;
-        private const float DELIVERY_FLIGHT_SECONDS = 45f;
+        private const float DELIVERY_FLIGHT_SECONDS = 28f;
 
         private void TryCallDelivery()
         {
@@ -940,7 +936,7 @@ namespace SaifFuelMod
                     new TextElement($"Fuel delivery hovering - filling... {(int)(_deliveryFillProgress * 100)}%", new PointF(20, 60), 0.26f, Color.FromArgb(255, 180, 255, 180), Font.ChaletLondon).Draw();
 
                     MovePlaneTo(playerPed.Position + new Vector3(0, 0, 20f)); // stay just above the player
-                    _deliveryFillProgress += Game.LastFrameTime / 50f; // slow pipe refuel, not instant
+                    _deliveryFillProgress += Game.LastFrameTime / 22f;
                     _fuel = Math.Min(_maxFuel, _maxFuel * Math.Min(1f, _deliveryFillProgress));
 
                     if (_deliveryFillProgress >= 1f)
@@ -967,8 +963,8 @@ namespace SaifFuelMod
                     break;
 
                 case DeliveryPhase.Leaving:
-                    // flies back out the way it came in, then despawns - slow retreat
-                    _deliveryFlightT += Game.LastFrameTime / 35f;
+                    // flies back out the way it came in, then despawns
+                    _deliveryFlightT += Game.LastFrameTime / 18f;
                     Vector3 leavePos = Vector3.Lerp(_deliveryTargetPos, _deliveryStartPos, Math.Min(1f, _deliveryFlightT));
                     MovePlaneTo(leavePos);
                     if (_deliveryFlightT >= 1f) CleanupDelivery();
@@ -988,9 +984,7 @@ namespace SaifFuelMod
                 // standard Atan2(x,y) conversion, which rotated the heading off by
                 // up to 180 degrees - that's why it looked like it was facing
                 // backwards while flying toward the player.
-                // GTA heading 0=North with clockwise rotation, so X must be
-                // negated - this was the flip causing it to face backwards
-                float heading = (float)(Math.Atan2(-dir.X, dir.Y) * (180.0 / Math.PI));
+                float heading = (float)(Math.Atan2(dir.X, dir.Y) * (180.0 / Math.PI));
                 if (heading < 0) heading += 360f;
                 _deliveryPlane.Heading = heading;
             }
@@ -1023,7 +1017,7 @@ namespace SaifFuelMod
             float panelWidth = 170f * _hudScale, panelHeight = 90f * _hudScale;
 
             float fuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 0f;
-            _displayedFuelPct += (fuelPct - _displayedFuelPct) * Math.Min(1f, Game.LastFrameTime * 6f);
+            _displayedFuelPct += (fuelPct - _displayedFuelPct) * Math.Min(1f, Game.LastFrameTime * 2.5f);
 
             // panel background (LCD look)
             new ContainerElement(new PointF(x - 10, panelTop - 10), new SizeF(panelWidth + 20, panelHeight + 20), Color.FromArgb(230, 10, 15, 10)).Draw();
