@@ -201,7 +201,6 @@ namespace SaifFuelMod
         private Ped _deliveryPilot = null;
         private Blip _deliveryBlip = null;
         private float _deliveryFillProgress = 0f;
-        private DateTime _deliveryLeaveAt = DateTime.MinValue;
         private const int DELIVERY_COST = 120;
 
         private readonly List<Vehicle> _ambientVehicles = new List<Vehicle>();
@@ -1005,6 +1004,8 @@ namespace SaifFuelMod
         // =================================================================
         // Simple digital dashboard, matching the reference motorcycle speedo:
         // big "KM/H" digital number on top, small "E [----] F" fuel bar under it.
+        // Single vertical fuel bar docked beside the minimap, matching the
+        // reference screenshot - green normally, red when running low.
         private void UpdateHud()
         {
             Ped playerPed = Game.Player.Character;
@@ -1012,49 +1013,31 @@ namespace SaifFuelMod
             Vehicle veh = playerPed.CurrentVehicle;
             if (veh == null || !veh.Exists()) return;
 
+            const int SEGMENTS = 10;
             float x = _hudOffsetX;
-            float panelTop = Screen.Height + _hudOffsetY; // _hudOffsetY is negative
-            float panelWidth = 170f * _hudScale, panelHeight = 90f * _hudScale;
+            float barHeight = 220f * _hudScale;
+            float barTop = Screen.Height + _hudOffsetY - barHeight; // _hudOffsetY is negative
+            float segGap = 3f;
+            float segW = 26f * _hudScale;
+            float segH = (barHeight - segGap * (SEGMENTS - 1)) / SEGMENTS;
 
             float fuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 0f;
             _displayedFuelPct += (fuelPct - _displayedFuelPct) * Math.Min(1f, Game.LastFrameTime * 2.5f);
+            bool isLow = fuelPct < 0.2f;
 
-            // panel background (LCD look)
-            new ContainerElement(new PointF(x - 10, panelTop - 10), new SizeF(panelWidth + 20, panelHeight + 20), Color.FromArgb(230, 10, 15, 10)).Draw();
-            new ContainerElement(new PointF(x, panelTop), new SizeF(panelWidth, panelHeight), Color.FromArgb(255, 5, 25, 40)).Draw();
-
-            // digital speed
-            int kmh = (int)(veh.Speed * 3.6f);
-            new TextElement($"{kmh}", new PointF(x + panelWidth / 2 - 22, panelTop + 4), 0.55f, Color.FromArgb(255, 140, 220, 255), Font.ChaletLondon).Draw();
-            new TextElement("KM/H", new PointF(x + panelWidth / 2 - 20, panelTop + 40), 0.24f, Color.FromArgb(220, 180, 220, 255), Font.ChaletLondon).Draw();
-
-            // E [----] F fuel bar, same LCD style as the reference gauge
-            const int SEGMENTS = 8;
-            float barY = panelTop + panelHeight - 22f;
-            float barX = x + 22f;
-            float barWidth = panelWidth - 40f;
-            float segW = barWidth / SEGMENTS - 2f;
-
-            new TextElement("E", new PointF(x + 4, barY - 3), 0.24f, Color.FromArgb(255, 220, 220, 220), Font.ChaletLondon).Draw();
-            new TextElement("F", new PointF(x + panelWidth - 14, barY - 3), 0.24f, Color.FromArgb(255, 220, 220, 220), Font.ChaletLondon).Draw();
+            new ContainerElement(new PointF(x - 6, barTop - 6), new SizeF(segW + 12, barHeight + 12), Color.FromArgb(140, 0, 0, 0)).Draw();
 
             int litSegments = (int)Math.Round(_displayedFuelPct * SEGMENTS);
             for (int i = 0; i < SEGMENTS; i++)
             {
-                bool lit = i < litSegments;
-                Color segColor = !lit ? Color.FromArgb(120, 40, 50, 60)
-                                 : (fuelPct < 0.2f ? Color.Red : Color.FromArgb(255, 140, 220, 255));
-                new ContainerElement(new PointF(barX + i * (segW + 2f), barY), new SizeF(segW, 10), segColor).Draw();
+                bool lit = i >= (SEGMENTS - litSegments);
+                Color segColor = !lit ? Color.FromArgb(150, 45, 45, 45) : (isLow ? Color.Red : Color.LimeGreen);
+                float segY = barTop + i * (segH + segGap);
+                new ContainerElement(new PointF(x, segY), new SizeF(segW, segH), segColor).Draw();
             }
 
             if (_jerryCanFuel > 0.1f)
-                new TextElement($"Jerry can: {_jerryCanFuel:F0}/{JERRY_CAN_CAPACITY:F0}L", new PointF(x, panelTop + panelHeight + 16), 0.2f, Color.LightBlue, Font.ChaletLondon).Draw();
-
-            float oilPct = _engineOil / ENGINE_OIL_MAX;
-            Color oilColor = oilPct < 0.3f ? Color.Red : Color.LimeGreen;
-            new TextElement("OIL", new PointF(x, panelTop + panelHeight + 34), 0.2f, Color.White, Font.ChaletLondon).Draw();
-            new ContainerElement(new PointF(x + 30, panelTop + panelHeight + 34), new SizeF(panelWidth - 30, 8), Color.FromArgb(140, 60, 60, 60)).Draw();
-            new ContainerElement(new PointF(x + 30, panelTop + panelHeight + 34), new SizeF((panelWidth - 30) * oilPct, 8), oilColor).Draw();
+                new TextElement($"Jerry: {_jerryCanFuel:F0}/{JERRY_CAN_CAPACITY:F0}L", new PointF(x - 4, barTop - 22), 0.18f, Color.LightBlue, Font.ChaletLondon).Draw();
         }
 
         // =================================================================
