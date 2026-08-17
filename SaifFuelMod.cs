@@ -152,6 +152,7 @@ namespace SaifFuelMod
         private float _hudScale = 1.0f;
         private const string HudConfigPath = "scripts\\SaifFuelMod_hud.txt";
         private float _displayedFuelPct = 1f; // lerped toward the real value for a live-draining look
+        private float _displayedAccelPct = 0f; // lerped throttle display
 
         // =================================================================
         // VEHICLE STATE
@@ -1000,12 +1001,11 @@ namespace SaifFuelMod
         }
 
         // =================================================================
-        // HUD - animated flat fuel tank + speed track, fully custom position
+        // HUD - stripped to 2 elements only: vertical fuel bar (segments,
+        // same style/position as before) + horizontal accel/throttle line
+        // sitting just under it. Everything else (jerry text, speed number,
+        // etc.) removed per request.
         // =================================================================
-        // Simple digital dashboard, matching the reference motorcycle speedo:
-        // big "KM/H" digital number on top, small "E [----] F" fuel bar under it.
-        // Single vertical fuel bar docked beside the minimap, matching the
-        // reference screenshot - green normally, red when running low.
         private void UpdateHud()
         {
             Ped playerPed = Game.Player.Character;
@@ -1013,6 +1013,7 @@ namespace SaifFuelMod
             Vehicle veh = playerPed.CurrentVehicle;
             if (veh == null || !veh.Exists()) return;
 
+            // ---- FUEL BAR (vertical segments) ----
             const int SEGMENTS = 10;
             float x = _hudOffsetX;
             float barHeight = 220f * _hudScale;
@@ -1036,8 +1037,21 @@ namespace SaifFuelMod
                 new ContainerElement(new PointF(x, segY), new SizeF(segW, segH), segColor).Draw();
             }
 
-            if (_jerryCanFuel > 0.1f)
-                new TextElement($"Jerry: {_jerryCanFuel:F0}/{JERRY_CAN_CAPACITY:F0}L", new PointF(x - 4, barTop - 22), 0.18f, Color.LightBlue, Font.ChaletLondon).Draw();
+            // ---- ACCEL LINE (horizontal, fills with throttle input, sits
+            // just below the fuel bar) ----
+            float accelInput = Game.IsControlPressed(GTA.Control.VehicleAccelerate)
+                ? Function.Call<float>(Hash._GET_CONTROL_NORMAL, 0, (int)GTA.Control.VehicleAccelerate)
+                : 0f;
+            _displayedAccelPct += (accelInput - _displayedAccelPct) * Math.Min(1f, Game.LastFrameTime * 6f);
+
+            float lineW = barHeight; // match fuel bar length, drawn sideways under it
+            float lineH = 10f * _hudScale;
+            float lineX = x - (lineW - segW) / 2f;
+            float lineY = barTop + barHeight + 14f;
+
+            new ContainerElement(new PointF(lineX - 4, lineY - 4), new SizeF(lineW + 8, lineH + 8), Color.FromArgb(140, 0, 0, 0)).Draw();
+            new ContainerElement(new PointF(lineX, lineY), new SizeF(lineW, lineH), Color.FromArgb(150, 45, 45, 45)).Draw();
+            new ContainerElement(new PointF(lineX, lineY), new SizeF(lineW * Math.Min(1f, _displayedAccelPct), lineH), Color.Cyan).Draw();
         }
 
         // =================================================================
