@@ -1023,7 +1023,7 @@ namespace SaifFuelMod
         {
             var ox = new OutputArgument();
             var oy = new OutputArgument();
-            bool onScreen = Function.Call<bool>(Hash._WORLD3D_TO_SCREEN2D, world.X, world.Y, world.Z, ox, oy);
+            bool onScreen = Function.Call<bool>(Hash.GET_SCREEN_COORD_FROM_WORLD_COORD, world.X, world.Y, world.Z, ox, oy);
             screenX = onScreen ? ox.GetResult<float>() * Screen.Width : 0f;
             screenY = onScreen ? oy.GetResult<float>() * Screen.Height : 0f;
             return onScreen;
