@@ -152,7 +152,8 @@ namespace SaifFuelMod
         private float _hudScale = 1.0f;
         private const string HudConfigPath = "scripts\\SaifFuelMod_hud.txt";
         private float _displayedFuelPct = 1f; // lerped toward the real value for a live-draining look
-        private float _displayedAccelPct = 0f; // lerped throttle display
+        private float _displayedOilPct = 1f;
+        private float _displayedSpeedPct = 0f;
 
         // =================================================================
         // VEHICLE STATE
@@ -215,6 +216,8 @@ namespace SaifFuelMod
         private ObjectPool _pool;
         private NativeMenu _serviceMenu;
         private NativeListItem<int> _fuelAmountItem;
+        private int _fuelAmountItemCapLitres = -1;
+        private NativeItem _customAmountItem;
         private NativeItem _engineOilItem;
         private NativeItem _transOilItem;
         private NativeItem _repairItem;
@@ -297,12 +300,14 @@ namespace SaifFuelMod
             // ---- Service menu (auto-shown near the right pump) ----
             _serviceMenu = new NativeMenu("Saif Fuel Mod", "Fuel Station", "");
             _fuelAmountItem = new NativeListItem<int>("Fuel", IntSteps(5, 100, 5));
+            _customAmountItem = new NativeItem("Custom Amount...", "Type an exact litre amount to fill");
             _engineOilItem = new NativeItem("Engine Oil");
             _transOilItem = new NativeItem("Transmission Oil");
             _repairItem = new NativeItem("Repair Vehicle");
             _useJerryCanItem = new NativeItem("Use Jerry Can");
 
             _serviceMenu.Add(_fuelAmountItem);
+            _serviceMenu.Add(_customAmountItem);
             _serviceMenu.Add(_engineOilItem);
             _serviceMenu.Add(_transOilItem);
             _serviceMenu.Add(_repairItem);
@@ -379,6 +384,7 @@ namespace SaifFuelMod
         private void ServiceMenu_ItemActivated(object sender, ItemActivatedArgs e)
         {
             if (e.Item == _fuelAmountItem) ConfirmRefuel(_fuelAmountItem.SelectedItem);
+            else if (e.Item == _customAmountItem) ConfirmCustomRefuel();
             else if (e.Item == _engineOilItem) ConfirmEngineOil();
             else if (e.Item == _transOilItem) ConfirmTransOil();
             else if (e.Item == _repairItem) ConfirmRepair();
@@ -405,7 +411,7 @@ namespace SaifFuelMod
                     // which call Model.Request() -> Script.Yield() internally. Yielding
                     // is illegal before the script's main loop starts, so spawning is
                     // deferred to the first Tick instead of the constructor.
-                    foreach (var st in _stations) CreateStationBlips(st);
+                    CreateStationBlipsDeduped();
                     _stationsSpawned = true;
                 }
 
@@ -421,6 +427,7 @@ namespace SaifFuelMod
                 UpdateSiphonProgress();
                 UpdateDelivery();
                 UpdateAmbientVehicles();
+                UpdateAutoJerryCanRefill();
             }
             catch (Exception ex)
             {
@@ -448,6 +455,23 @@ namespace SaifFuelMod
             b.Color = BlipColor.Green;
             b.Name = st.Name;
             b.IsShortRange = true;
+        }
+
+        // Real GTA shops show ONE icon even where several outlets sit side by
+        // side - only place a blip if no earlier station's anchor is already
+        // close by, so stations bunched together don't stack overlapping icons.
+        private const float BLIP_CLUSTER_RADIUS = 60f;
+        private void CreateStationBlipsDeduped()
+        {
+            var placedAnchors = new List<Vector3>();
+            foreach (var st in _stations)
+            {
+                Vector3 anchor = st.Machines.Values.First();
+                bool nearExisting = placedAnchors.Any(p => p.DistanceTo(anchor) < BLIP_CLUSTER_RADIUS);
+                if (nearExisting) continue;
+                CreateStationBlips(st);
+                placedAnchors.Add(anchor);
+            }
         }
 
         // =================================================================
@@ -619,16 +643,27 @@ namespace SaifFuelMod
                 return;
             }
 
-            // keep the menu's live numbers up to date while it's open
-            float space = Math.Max(0f, _maxFuel - _fuel);
-            _fuelAmountItem.Items = IntSteps(5, Math.Max(5, (int)space), 5).ToList();
-            // NOTE: NativeListItem<T>.Items's setter does not clamp the selected
-            // index - reusing a stale index after the list shrinks throws
-            // IndexOutOfRangeException the next time SelectedItem is read. Always
-            // reset to a safe index right after reassigning.
-            if (_fuelAmountItem.Items.Count > 0) _fuelAmountItem.SelectedIndex = 0;
+            // keep the menu's live numbers up to date while it's open.
+            // BUG FIX: this used to reassign _fuelAmountItem.Items AND force
+            // SelectedIndex back to 0 every single tick (~60x/sec), which wiped
+            // out whatever amount the player had scrolled to before they could
+            // ever press Enter - the pump always dispensed 5L no matter what
+            // was shown. Now the list is only rebuilt when the max cap
+            // actually changes, and the selected index is preserved (only
+            // clamped if it's now out of range).
+            int maxLitres = Math.Max(5, (int)Math.Max(0f, _maxFuel - _fuel));
+            if (maxLitres != _fuelAmountItemCapLitres)
+            {
+                int prevSelected = _fuelAmountItem.Items.Count > 0 ? _fuelAmountItem.SelectedItem : 5;
+                _fuelAmountItem.Items = IntSteps(5, maxLitres, 5).ToList();
+                _fuelAmountItemCapLitres = maxLitres;
+                int idx = _fuelAmountItem.Items.IndexOf(prevSelected);
+                _fuelAmountItem.SelectedIndex = idx >= 0 ? idx : 0;
+            }
+
             float price = GetFuelPrice(type, station);
             _fuelAmountItem.Description = $"{type} @ ${price:F2}/L - Total: ${_fuelAmountItem.SelectedItem * price:F2}";
+            _customAmountItem.Description = "Type an exact litre amount to fill";
             _engineOilItem.Description = $"${(ENGINE_OIL_MAX - _engineOil) * ENGINE_OIL_PRICE_PER_UNIT:F2}";
             _transOilItem.Description = $"${(TRANS_OIL_MAX - _transOil) * TRANS_OIL_PRICE_PER_UNIT:F2}";
             _repairItem.Description = $"${GetRepairCost(veh):F2}";
@@ -643,6 +678,23 @@ namespace SaifFuelMod
             if (litres <= 0.5f) { Notification.Show("~y~Tank is already full."); return; }
             float cost = litres * GetFuelPrice(_nearFuelType, _nearStation);
             StartJob(ActiveJob.Refuel, cost, "Refueling", litres);
+        }
+
+        private void ConfirmCustomRefuel()
+        {
+            float space = Math.Max(0f, _maxFuel - _fuel);
+            if (space <= 0.5f) { Notification.Show("~y~Tank is already full."); return; }
+
+            string input = Game.GetUserInput(WindowTitle.EnterMessage60, $"{(int)space}", 5);
+            if (string.IsNullOrWhiteSpace(input)) return;
+            if (!float.TryParse(input, out float litres) || litres <= 0f)
+            {
+                Notification.Show("~r~Enter a valid number of litres.");
+                return;
+            }
+
+            litres = Math.Min(litres, space);
+            ConfirmRefuel(litres);
         }
 
         private void ConfirmEngineOil()
@@ -839,40 +891,32 @@ namespace SaifFuelMod
         private float _deliveryFlightT;
         private const float DELIVERY_FLIGHT_SECONDS = 28f;
 
+        private bool _deliveryToTankDirect; // true = boat/air (fills tank), false = land (fills jerry can)
+        private const float HOVER_DURATION_SECONDS = 12f;
+
         private void TryCallDelivery()
         {
             if (_deliveryPhase != DeliveryPhase.None) { Notification.Show("~y~A delivery is already on its way."); return; }
             if (_money < DELIVERY_COST) { Notification.Show($"~r~Not enough money (${DELIVERY_COST})."); return; }
-            if (_stations.Count == 0) return;
 
             Ped playerPed = Game.Player.Character;
 
-            // Deliver to the nearest STATION rather than the player's raw position -
-            // stations are open-air with clear sky above, so the plane never has to
-            // navigate around buildings/trees at all (that's what was getting it
-            // stuck before). If the player is on a boat/aircraft we instead fly
-            // toward them directly since they're already out in the open.
+            // Always fly to the PLAYER now (not a station) so the hose visual
+            // and hover actually happen where the player can see them.
             bool boatOrAir = playerPed.IsInVehicle() &&
                 (playerPed.CurrentVehicle.ClassType == VehicleClass.Boats ||
                  playerPed.CurrentVehicle.ClassType == VehicleClass.Planes ||
                  playerPed.CurrentVehicle.ClassType == VehicleClass.Helicopters);
+            _deliveryToTankDirect = boatOrAir;
 
-            Station nearest = null; float bestDist = float.MaxValue;
-            foreach (var st in _stations)
-            {
-                Vector3 anchor = st.Machines.Values.First();
-                float d = anchor.DistanceTo(playerPed.Position);
-                if (d < bestDist) { bestDist = d; nearest = st; }
-            }
-
-            Vector3 groundTarget = boatOrAir ? playerPed.Position : nearest.Machines.Values.First();
-            _deliveryTargetPos = groundTarget + new Vector3(0, 0, 45f); // hover height above the target
-            _deliveryStartPos = _deliveryTargetPos + (playerPed.ForwardVector * -600f) + new Vector3(0, 0, 80f);
+            _deliveryTargetPos = playerPed.Position + new Vector3(0, 0, 22f); // hover height above player
+            _deliveryStartPos = _deliveryTargetPos + (playerPed.ForwardVector * -500f) + new Vector3(0, 0, 60f);
 
             _deliveryPlane = World.CreateVehicle(VehicleHash.Maverick, _deliveryStartPos, 0f);
             if (_deliveryPlane == null) { Notification.Show("~r~Delivery failed to launch."); return; }
             _deliveryPlane.IsPersistent = true;
             _deliveryPlane.IsPositionFrozen = true; // we drive this one by hand, not the physics/AI
+            MovePlaneTo(_deliveryStartPos, faceDown: true); // face the target immediately instead of spawning sideways-on
 
             _deliveryPilot = World.CreatePed(PedHash.Pilot01SMM, _deliveryStartPos);
             if (_deliveryPilot != null)
@@ -891,7 +935,7 @@ namespace SaifFuelMod
             _deliveryPhase = DeliveryPhase.Inbound;
             _deliveryFlightT = 0f;
             _deliveryFillProgress = 0f;
-            Notification.Show($"~g~Fuel delivery dispatched~w~ (${DELIVERY_COST}). Watch the sky over {(boatOrAir ? "you" : nearest.Name)}.");
+            Notification.Show($"~g~Fuel delivery dispatched~w~ (${DELIVERY_COST}). Watch the sky above you.");
         }
 
         private void UpdateDelivery()
@@ -909,11 +953,7 @@ namespace SaifFuelMod
             {
                 case DeliveryPhase.Inbound:
                     {
-                        bool boatOrAir = playerPed.IsInVehicle() &&
-                            (playerPed.CurrentVehicle.ClassType == VehicleClass.Boats ||
-                             playerPed.CurrentVehicle.ClassType == VehicleClass.Planes ||
-                             playerPed.CurrentVehicle.ClassType == VehicleClass.Helicopters);
-                        if (boatOrAir) _deliveryTargetPos = playerPed.Position + new Vector3(0, 0, 45f);
+                        _deliveryTargetPos = playerPed.Position + new Vector3(0, 0, 22f);
 
                         _deliveryFlightT += Game.LastFrameTime / DELIVERY_FLIGHT_SECONDS;
                         float t = Math.Min(1f, _deliveryFlightT);
@@ -925,42 +965,48 @@ namespace SaifFuelMod
 
                         if (t >= 1f)
                         {
-                            _deliveryPhase = boatOrAir ? DeliveryPhase.Hovering : DeliveryPhase.WaitingPickup;
+                            _deliveryPhase = DeliveryPhase.Hovering;
                             _deliveryFillProgress = 0f;
-                            if (!boatOrAir) Notification.Show("~g~Delivery has arrived at the station~w~ - fuel added to your jerry can.");
                         }
                         break;
                     }
 
                 case DeliveryPhase.Hovering:
-                    new TextElement($"Fuel delivery hovering - filling... {(int)(_deliveryFillProgress * 100)}%", new PointF(20, 60), 0.26f, Color.FromArgb(255, 180, 255, 180), Font.ChaletLondon).Draw();
-
-                    MovePlaneTo(playerPed.Position + new Vector3(0, 0, 20f)); // stay just above the player
-                    _deliveryFillProgress += Game.LastFrameTime / 22f;
-                    _fuel = Math.Min(_maxFuel, _maxFuel * Math.Min(1f, _deliveryFillProgress));
-
-                    if (_deliveryFillProgress >= 1f)
                     {
-                        Notification.Show("~g~Tank filled by air delivery!");
-                        SaveData();
-                        _deliveryPhase = DeliveryPhase.Leaving;
-                        _deliveryFlightT = 0f;
-                    }
-                    break;
+                        // stay locked above the player, facing down toward them
+                        Vector3 hoverPos = playerPed.Position + new Vector3(0, 0, 22f);
+                        MovePlaneTo(hoverPos, faceDown: true);
 
-                case DeliveryPhase.WaitingPickup:
-                    // NOTE: this used to spawn a physical jerry can prop to walk over
-                    // and collect, but the model name wasn't a real GTA V asset (it
-                    // never appeared). Rather than guess another name blind, the fuel
-                    // is credited directly once the plane arrives - reliable every time.
-                    {
-                        float added = Math.Min(JERRY_CAN_CAPACITY - _jerryCanFuel, 20f);
-                        _jerryCanFuel += Math.Max(0f, added);
-                        SaveData();
+                        // hose/pipe visual: dotted line from under the heli down to the player
+                        Vector3 hoseStart = hoverPos + new Vector3(0, 0, -3f);
+                        Vector3 hoseEnd = playerPed.Position + new Vector3(0, 0, 1f);
+                        DrawFuelHose(hoseStart, hoseEnd, Color.FromArgb(230, 255, 200, 60));
+
+                        _deliveryFillProgress += Game.LastFrameTime / HOVER_DURATION_SECONDS;
+                        float pct = Math.Min(1f, _deliveryFillProgress);
+
+                        if (_deliveryToTankDirect)
+                            _fuel = Math.Min(_maxFuel, _maxFuel * pct);
+                        else
+                            _jerryCanFuel = Math.Min(JERRY_CAN_CAPACITY, JERRY_CAN_CAPACITY * pct);
+
+                        // on-screen fill progress bar
+                        float barX = 20f, barY = 90f;
+                        new ContainerElement(new PointF(barX, barY), new SizeF(300, 30), Color.FromArgb(200, 20, 20, 20)).Draw();
+                        new ContainerElement(new PointF(barX + 5, barY + 20), new SizeF(290, 6), Color.FromArgb(150, 60, 60, 60)).Draw();
+                        new ContainerElement(new PointF(barX + 5, barY + 20), new SizeF(290 * pct, 6), Color.FromArgb(255, 255, 200, 60)).Draw();
+                        string target = _deliveryToTankDirect ? "tank" : "jerry can";
+                        new TextElement($"Fuel delivery hovering - filling {target}... {(int)(pct * 100)}%", new PointF(barX + 5, barY + 2), 0.24f, Color.White, Font.ChaletLondon).Draw();
+
+                        if (_deliveryFillProgress >= 1f)
+                        {
+                            Notification.Show(_deliveryToTankDirect ? "~g~Tank filled by air delivery!" : "~g~Jerry can filled by air delivery!");
+                            SaveData();
+                            _deliveryPhase = DeliveryPhase.Leaving;
+                            _deliveryFlightT = 0f;
+                        }
+                        break;
                     }
-                    _deliveryPhase = DeliveryPhase.Leaving;
-                    _deliveryFlightT = 0f;
-                    break;
 
                 case DeliveryPhase.Leaving:
                     // flies back out the way it came in, then despawns
@@ -972,12 +1018,42 @@ namespace SaifFuelMod
             }
         }
 
+        // Projects a world point to screen space (0-1 normalized -> pixels).
+        private bool WorldToScreen(Vector3 world, out float screenX, out float screenY)
+        {
+            var ox = new OutputArgument();
+            var oy = new OutputArgument();
+            bool onScreen = Function.Call<bool>(Hash._WORLD3D_TO_SCREEN2D, world.X, world.Y, world.Z, ox, oy);
+            screenX = onScreen ? ox.GetResult<float>() * Screen.Width : 0f;
+            screenY = onScreen ? oy.GetResult<float>() * Screen.Height : 0f;
+            return onScreen;
+        }
+
+        // Draws a dotted "hose/pipe" line on screen between two world points -
+        // used to show fuel visibly flowing from the heli down to the player.
+        private void DrawFuelHose(Vector3 fromWorld, Vector3 toWorld, Color color)
+        {
+            if (!WorldToScreen(fromWorld, out float x1, out float y1)) return;
+            if (!WorldToScreen(toWorld, out float x2, out float y2)) return;
+
+            const int SEGMENTS = 16;
+            for (int i = 0; i <= SEGMENTS; i++)
+            {
+                float t = i / (float)SEGMENTS;
+                float px = x1 + (x2 - x1) * t;
+                float py = y1 + (y2 - y1) * t;
+                new ContainerElement(new PointF(px - 3, py - 3), new SizeF(6, 6), color).Draw();
+            }
+        }
+
         // Moves the delivery plane by hand instead of relying on an AI flight
         // task - guarantees it never clips a building or gets stuck on terrain,
         // since it's just following a straight scripted line through open air.
-        private void MovePlaneTo(Vector3 pos)
+        // faceDown=true is used while hovering so it visibly noses toward the
+        // player/hose target instead of staring off sideways.
+        private void MovePlaneTo(Vector3 pos, bool faceDown = false)
         {
-            Vector3 dir = pos - _deliveryPlane.Position;
+            Vector3 dir = faceDown ? (_deliveryTargetPos - pos) : (pos - _deliveryPlane.Position);
             if (dir.Length() > 0.01f)
             {
                 // NOTE: this previously had an extra "* -1f + 90f" on top of the
@@ -1001,10 +1077,9 @@ namespace SaifFuelMod
         }
 
         // =================================================================
-        // HUD - stripped to 2 elements only: vertical fuel bar (segments,
-        // same style/position as before) + horizontal accel/throttle line
-        // sitting just under it. Everything else (jerry text, speed number,
-        // etc.) removed per request.
+        // HUD - single combined bar-shape box with 3 vertical columns side
+        // by side: Fuel (green/red), Oil (amber/brown), Speed (cyan, scaled
+        // 0-240 km/h). One shared backing panel instead of 3 separate boxes.
         // =================================================================
         private void UpdateHud()
         {
@@ -1013,43 +1088,57 @@ namespace SaifFuelMod
             Vehicle veh = playerPed.CurrentVehicle;
             if (veh == null || !veh.Exists()) return;
 
-            // ---- FUEL BAR (vertical segments) ----
             const int SEGMENTS = 10;
-            float x = _hudOffsetX;
+            const float MAX_SPEED_KMH = 240f;
+
             float barHeight = 220f * _hudScale;
             float barTop = Screen.Height + _hudOffsetY - barHeight; // _hudOffsetY is negative
             float segGap = 3f;
-            float segW = 26f * _hudScale;
+            float colW = 26f * _hudScale;
+            float colGap = 8f * _hudScale;
             float segH = (barHeight - segGap * (SEGMENTS - 1)) / SEGMENTS;
 
+            // shared backing panel wide enough for all 3 columns
+            float panelW = colW * 3f + colGap * 2f;
+            float panelX = _hudOffsetX;
+            new ContainerElement(new PointF(panelX - 6, barTop - 6), new SizeF(panelW + 12, barHeight + 12), Color.FromArgb(160, 0, 0, 0)).Draw();
+
+            // ---- Column 1: FUEL ----
             float fuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 0f;
             _displayedFuelPct += (fuelPct - _displayedFuelPct) * Math.Min(1f, Game.LastFrameTime * 2.5f);
-            bool isLow = fuelPct < 0.2f;
+            bool fuelLow = fuelPct < 0.2f;
+            DrawHudColumn(panelX, barTop, colW, segH, segGap, SEGMENTS, _displayedFuelPct,
+                Color.LimeGreen, Color.Red, fuelLow);
 
-            new ContainerElement(new PointF(x - 6, barTop - 6), new SizeF(segW + 12, barHeight + 12), Color.FromArgb(140, 0, 0, 0)).Draw();
+            // ---- Column 2: OIL (worse of engine/trans oil, as %) ----
+            float oilPct = Math.Min(_engineOil / ENGINE_OIL_MAX, _transOil / TRANS_OIL_MAX);
+            _displayedOilPct += (oilPct - _displayedOilPct) * Math.Min(1f, Game.LastFrameTime * 2.5f);
+            bool oilLow = oilPct < 0.2f;
+            float col2X = panelX + colW + colGap;
+            DrawHudColumn(col2X, barTop, colW, segH, segGap, SEGMENTS, _displayedOilPct,
+                Color.FromArgb(255, 200, 140, 40), Color.Red, oilLow);
 
-            int litSegments = (int)Math.Round(_displayedFuelPct * SEGMENTS);
-            for (int i = 0; i < SEGMENTS; i++)
+            // ---- Column 3: SPEED (vertical, fills bottom-up like the others) ----
+            float speedKmh = veh.Speed * 3.6f;
+            float speedPct = Math.Min(1f, speedKmh / MAX_SPEED_KMH);
+            _displayedSpeedPct += (speedPct - _displayedSpeedPct) * Math.Min(1f, Game.LastFrameTime * 6f);
+            float col3X = panelX + (colW + colGap) * 2f;
+            DrawHudColumn(col3X, barTop, colW, segH, segGap, SEGMENTS, _displayedSpeedPct,
+                Color.Cyan, Color.Cyan, false);
+        }
+
+        // Draws one vertical segmented column (bottom-up fill) - shared by
+        // fuel/oil/speed so all three read the same way.
+        private void DrawHudColumn(float x, float barTop, float colW, float segH, float segGap, int segments, float pct, Color normalColor, Color lowColor, bool isLow)
+        {
+            int lit = (int)Math.Round(Math.Max(0f, Math.Min(1f, pct)) * segments);
+            for (int i = 0; i < segments; i++)
             {
-                bool lit = i >= (SEGMENTS - litSegments);
-                Color segColor = !lit ? Color.FromArgb(150, 45, 45, 45) : (isLow ? Color.Red : Color.LimeGreen);
+                bool on = i >= (segments - lit);
+                Color c = !on ? Color.FromArgb(150, 45, 45, 45) : (isLow ? lowColor : normalColor);
                 float segY = barTop + i * (segH + segGap);
-                new ContainerElement(new PointF(x, segY), new SizeF(segW, segH), segColor).Draw();
+                new ContainerElement(new PointF(x, segY), new SizeF(colW, segH), c).Draw();
             }
-
-            // ---- ACCEL LINE (horizontal, fills with throttle input, sits
-            // just below the fuel bar) ----
-            float accelInput = Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate);
-            _displayedAccelPct += (accelInput - _displayedAccelPct) * Math.Min(1f, Game.LastFrameTime * 6f);
-
-            float lineW = barHeight; // match fuel bar length, drawn sideways under it
-            float lineH = 10f * _hudScale;
-            float lineX = x - (lineW - segW) / 2f;
-            float lineY = barTop + barHeight + 14f;
-
-            new ContainerElement(new PointF(lineX - 4, lineY - 4), new SizeF(lineW + 8, lineH + 8), Color.FromArgb(140, 0, 0, 0)).Draw();
-            new ContainerElement(new PointF(lineX, lineY), new SizeF(lineW, lineH), Color.FromArgb(150, 45, 45, 45)).Draw();
-            new ContainerElement(new PointF(lineX, lineY), new SizeF(lineW * Math.Min(1f, _displayedAccelPct), lineH), Color.Cyan).Draw();
         }
 
         // =================================================================
@@ -1174,6 +1263,7 @@ namespace SaifFuelMod
             }
 
             _displayedFuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 1f;
+            _displayedOilPct = Math.Min(_engineOil / ENGINE_OIL_MAX, _transOil / TRANS_OIL_MAX);
             _radioOn = true;
         }
 
@@ -1268,6 +1358,28 @@ namespace SaifFuelMod
         // directly - no need to open a menu for this simple action.
         private void TryQuickJerryCanRefill()
         {
+            DoJerryCanRefill(true);
+        }
+
+        // Auto version: fires every tick while the jerry can is the equipped
+        // weapon and the player is standing close to one of their own
+        // tracked vehicles - no key press needed, matches "walk up = it just
+        // pours" behaviour. Rate-limited so it doesn't spam notifications.
+        private DateTime _lastAutoJerryRefill = DateTime.MinValue;
+        private void UpdateAutoJerryCanRefill()
+        {
+            Ped playerPed = Game.Player.Character;
+            if (playerPed.IsInVehicle()) return;
+            if (playerPed.Weapons.Current == null || playerPed.Weapons.Current.Hash != WeaponHash.PetrolCan) return;
+            if (_jerryCanFuel <= 0.2f) return;
+            if ((DateTime.Now - _lastAutoJerryRefill).TotalMilliseconds < 800) return;
+
+            _lastAutoJerryRefill = DateTime.Now;
+            DoJerryCanRefill(false);
+        }
+
+        private void DoJerryCanRefill(bool notifyIfFull)
+        {
             Ped playerPed = Game.Player.Character;
             if (playerPed.IsInVehicle()) return;
             if (_jerryCanFuel <= 0.2f) return;
@@ -1288,7 +1400,7 @@ namespace SaifFuelMod
             float maxFuelForThis = GetTankSize(nearest);
             float space = Math.Max(0f, maxFuelForThis - saved[0]);
             float transfer = Math.Min(_jerryCanFuel, space);
-            if (transfer <= 0.2f) { Notification.Show("~y~That tank is already full."); return; }
+            if (transfer <= 0.2f) { if (notifyIfFull) Notification.Show("~y~That tank is already full."); return; }
 
             saved[0] += transfer;
             _jerryCanFuel -= transfer;
