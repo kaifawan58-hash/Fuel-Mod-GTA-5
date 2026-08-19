@@ -534,7 +534,6 @@ namespace SaifFuelMod
                 float litresPerSecond = (6.5f / 100f) * modifier;
                 _currentUsageLps = litresPerSecond;
                 _fuel = Math.Max(0f, _fuel - litresPerSecond * Game.LastFrameTime);
-                SyncNativeFuelLevel(veh);
 
                 if (_fuel <= 0f)
                 {
@@ -548,18 +547,12 @@ namespace SaifFuelMod
             }
         }
 
-        // BUG FIX: the mod only ever tracked fuel in its own _fuel variable
-        // and never touched GTA's own native fuel level, so any dashboard
-        // that reads the native value (some motorcycles/newer vehicles show
-        // a real needle/gauge) always displayed "full" no matter what the
-        // mod's HUD said. This pushes our tracked percentage into the
-        // native value too so both agree.
-        private void SyncNativeFuelLevel(Vehicle veh)
-        {
-            if (veh == null || !veh.Exists()) return;
-            float pct = _maxFuel > 0f ? _fuel / _maxFuel : 0f;
-            Function.Call(Hash._SET_VEHICLE_FUEL_LEVEL, veh, pct * 100f);
-        }
+        // NOTE: there is no reliable public "set vehicle fuel level" native
+        // exposed by this SHVDN version (GTA V doesn't have a real fuel
+        // system by default - only third-party mods simulate one, same as
+        // this one does). Removed the sync attempt since the hash isn't
+        // available here; the mod's own _fuel value stays the single source
+        // of truth and drives the custom HUD bar.
 
         private float GetTankSize(Vehicle veh)
         {
@@ -1490,7 +1483,6 @@ namespace SaifFuelMod
 
             _displayedFuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 1f;
             _radioOn = true;
-            SyncNativeFuelLevel(veh);
         }
 
         // =================================================================
