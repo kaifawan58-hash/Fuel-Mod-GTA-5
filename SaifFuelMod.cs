@@ -221,7 +221,7 @@ namespace SaifFuelMod
 
             Tick += OnTick;
             KeyDown += OnKeyDown;
-            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); };
+            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); ClearPlayerMissiles(); };
 
         }
 
@@ -1132,6 +1132,9 @@ namespace SaifFuelMod
             Ped playerPed = Game.Player.Character;
             bool active = playerPed.IsInVehicle() &&
                 (playerPed.CurrentVehicle.ClassType == VehicleClass.Planes || playerPed.CurrentVehicle.ClassType == VehicleClass.Helicopters);
+            Vehicle myVeh = active ? playerPed.CurrentVehicle : null;
+
+            UpdatePlayerMissiles(playerPed, active, myVeh);
 
             if (!active)
             {
@@ -1139,7 +1142,6 @@ namespace SaifFuelMod
                 return;
             }
 
-            Vehicle myVeh = playerPed.CurrentVehicle;
             var seenHandles = new HashSet<int>();
             bool anyLock = false;
 
@@ -1212,6 +1214,100 @@ namespace SaifFuelMod
             foreach (var b in _threatBlips.Values)
                 if (b != null && b.Exists()) b.Delete();
             _threatBlips.Clear();
+        }
+
+        // =================================================================
+        // PLAYER-FIRED MISSILE TRACKING - shows YOUR missile on the main
+        // map too, using a real native Blip (no overlay/box). SHVDN doesn't
+        // expose the raw in-flight projectile entity, so the blip is
+        // advanced manually - but it actively STEERS toward the nearest
+        // locked hostile target every tick (proper homing curve), falling
+        // back to a straight flight path only if nothing is locked.
+        // =================================================================
+        private class PlayerMissile { public Vector3 Position; public Vector3 Direction; public float LifeLeft; public Blip Blip; public int TargetHandle; }
+        private readonly List<PlayerMissile> _playerMissiles = new List<PlayerMissile>();
+        private bool _wasShootingLastTick = false;
+        private const float PLAYER_MISSILE_SPEED = 280f; // m/s
+        private const float PLAYER_MISSILE_LIFETIME = 6f;
+        private const float PLAYER_MISSILE_TURN_RATE = 3.5f; // radians/sec steering toward target
+
+        private void UpdatePlayerMissiles(Ped playerPed, bool active, Vehicle myVeh)
+        {
+            if (active)
+            {
+                bool isShooting = Function.Call<bool>(Hash.IS_PED_SHOOTING, playerPed);
+                if (isShooting && !_wasShootingLastTick)
+                {
+                    // lock onto the nearest currently-tracked hostile threat, if any
+                    int targetHandle = 0;
+                    float bestDist = float.MaxValue;
+                    foreach (var handle in _threatBlips.Keys)
+                    {
+                        var ent = Entity.FromHandle(handle);
+                        if (ent == null || !ent.Exists()) continue;
+                        float d = ent.Position.DistanceTo(myVeh.Position);
+                        if (d < bestDist) { bestDist = d; targetHandle = handle; }
+                    }
+
+                    var m = new PlayerMissile
+                    {
+                        Position = myVeh.Position + myVeh.ForwardVector * 6f,
+                        Direction = myVeh.ForwardVector,
+                        LifeLeft = PLAYER_MISSILE_LIFETIME,
+                        TargetHandle = targetHandle
+                    };
+                    m.Blip = World.CreateBlip(m.Position);
+                    m.Blip.Sprite = BlipSprite.Standard;
+                    m.Blip.Color = BlipColor.Blue;
+                    m.Blip.Scale = 0.7f;
+                    m.Blip.Name = targetHandle != 0 ? "Your Missile (Homing)" : "Your Missile";
+                    m.Blip.IsFlashing = true;
+                    _playerMissiles.Add(m);
+                }
+                _wasShootingLastTick = isShooting;
+            }
+            else
+            {
+                _wasShootingLastTick = false;
+            }
+
+            for (int i = _playerMissiles.Count - 1; i >= 0; i--)
+            {
+                var m = _playerMissiles[i];
+
+                // steer toward the live target position each tick - this is
+                // what actually makes it curve like a real guided missile
+                // instead of just flying dead straight.
+                Entity target = m.TargetHandle != 0 ? Entity.FromHandle(m.TargetHandle) : null;
+                bool targetAlive = target != null && target.Exists();
+
+                if (targetAlive)
+                {
+                    Vector3 toTarget = (target.Position - m.Position).Normalized;
+                    float turnStep = PLAYER_MISSILE_TURN_RATE * Game.LastFrameTime;
+                    m.Direction = Vector3.Lerp(m.Direction, toTarget, Math.Min(1f, turnStep)).Normalized;
+                }
+
+                m.Position += m.Direction * PLAYER_MISSILE_SPEED * Game.LastFrameTime;
+                m.LifeLeft -= Game.LastFrameTime;
+                if (m.Blip != null && m.Blip.Exists()) m.Blip.Position = m.Position;
+
+                bool hitTarget = targetAlive && target.Position.DistanceTo(m.Position) < 15f;
+                bool hitAnyThreat = !targetAlive && _threatBlips.Values.Any(b => b != null && b.Exists() && b.Position.DistanceTo(m.Position) < 25f);
+
+                if (m.LifeLeft <= 0f || hitTarget || hitAnyThreat)
+                {
+                    if (m.Blip != null && m.Blip.Exists()) m.Blip.Delete();
+                    _playerMissiles.RemoveAt(i);
+                }
+            }
+        }
+
+        private void ClearPlayerMissiles()
+        {
+            foreach (var m in _playerMissiles)
+                if (m.Blip != null && m.Blip.Exists()) m.Blip.Delete();
+            _playerMissiles.Clear();
         }
 
         // =================================================================
