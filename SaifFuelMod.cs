@@ -577,16 +577,19 @@ namespace SaifFuelMod
             {
                 // Usage now scales with actual engine load, not just speed:
                 // RPM (how hard the engine is spinning) and throttle input
-                // (how hard the player is pressing the gas) both feed in, so
-                // revving in place or climbing a hill under load burns more
-                // than cruising at the same speed with a light foot.
+                // (how hard the player is pressing the gas) are the PRIMARY
+                // drivers - revving in place or climbing a hill under load
+                // now genuinely burns more than idling, since load is no
+                // longer suppressed/capped by a low-speed factor. Speed only
+                // adds a mild extra drag/aero cost on top once cruising fast.
                 float speedKmh = veh.Speed * 3.6f;
-                float speedFactor = speedKmh < 5f ? 0.15f : Math.Min(1f, speedKmh / 140f) * 1.0f + (speedKmh > 100f ? -0.2f : 0f);
                 float rpm = veh.CurrentRPM; // 0-1 in SHVDN
                 float throttle = Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate);
-                float loadFactor = 0.3f + rpm * 0.5f + throttle * 0.4f; // idle still burns a little, WOT burns a lot
 
-                float modifier = Math.Max(0.08f, speedFactor) * loadFactor;
+                float loadFactor = 0.25f + rpm * 0.55f + throttle * 0.45f; // idle still burns a little, WOT burns a lot
+                float speedFactor = 1f + Math.Max(0f, (speedKmh - 60f) / 180f); // mild extra burn above ~60km/h, no cap on stationary revving
+
+                float modifier = loadFactor * speedFactor;
                 if (veh.ClassType == VehicleClass.Sports || veh.ClassType == VehicleClass.Super) modifier *= 1.2f;
                 if (veh.EngineHealth < 700f) modifier *= 1.3f;
                 modifier = Math.Min(modifier, 2.2f) * _fuelConsumeRate;
@@ -927,6 +930,11 @@ namespace SaifFuelMod
 
         private const float HOVER_DURATION_SECONDS = 12f;
 
+        // Hose lowering: how long the hose visually takes to reach down from
+        // the heli to the vehicle's fuel cap before fill actually begins.
+        private float _hoseExtendProgress = 0f;
+        private const float HOSE_EXTEND_SECONDS = 1.5f;
+
         private void TryCallDelivery()
         {
             if (_deliveryPhase != DeliveryPhase.None) { ShowToast("~y~A delivery is already on its way."); return; }
@@ -960,6 +968,7 @@ namespace SaifFuelMod
             _deliveryPhase = DeliveryPhase.Inbound;
             _deliveryFlightT = 0f;
             _deliveryFillProgress = 0f;
+            _hoseExtendProgress = 0f;
             ShowToast($"~g~Fuel delivery dispatched~w~ (${DELIVERY_COST}). Watch the sky above you.");
         }
 
@@ -992,6 +1001,7 @@ namespace SaifFuelMod
                         {
                             _deliveryPhase = DeliveryPhase.Hovering;
                             _deliveryFillProgress = 0f;
+                            _hoseExtendProgress = 0f;
                         }
                         break;
                     }
@@ -1002,13 +1012,33 @@ namespace SaifFuelMod
                         Vector3 hoverPos = playerPed.Position + new Vector3(0, 0, 22f);
                         MovePlaneTo(hoverPos, faceDown: true);
 
-                        // hose/pipe visual: dotted line from under the heli down
-                        // to the vehicle itself when the player is in one (looks
-                        // like it's actually attached to the vehicle refueling),
-                        // otherwise down to the player.
-                        Vector3 attachPoint = playerPed.IsInVehicle() ? playerPed.CurrentVehicle.Position : playerPed.Position;
+                        // Hose/pipe visual: dotted line from under the heli down
+                        // to the vehicle's fuel cap (rear of the vehicle, not
+                        // its center) so it looks like it's actually plugged in,
+                        // or down to the player if they're on foot.
+                        Vector3 attachPoint = playerPed.IsInVehicle()
+                            ? GetFuelCapPosition(playerPed.CurrentVehicle)
+                            : playerPed.Position;
                         Vector3 hoseStart = hoverPos + new Vector3(0, 0, -3f);
-                        Vector3 hoseEnd = attachPoint + new Vector3(0, 0, 1f);
+                        Vector3 hoseEnd = attachPoint + new Vector3(0, 0, 0.6f);
+
+                        // The hose lowers first - it visibly travels from the
+                        // heli down to the fuel cap over HOSE_EXTEND_SECONDS.
+                        // Fill only starts once the hose tip has actually
+                        // reached the cap; previously fill began the very
+                        // same tick Hovering started, so the hose never
+                        // appeared to "arrive" before fuel was already going in.
+                        if (_hoseExtendProgress < 1f)
+                        {
+                            _hoseExtendProgress = Math.Min(1f, _hoseExtendProgress + Game.LastFrameTime / HOSE_EXTEND_SECONDS);
+                            Vector3 hoseTip = Vector3.Lerp(hoseStart, hoseEnd, _hoseExtendProgress);
+                            DrawFuelHose(hoseStart, hoseTip, Color.FromArgb(230, 255, 200, 60));
+
+                            new TextElement("Lowering fuel hose...", new PointF(20, 60), 0.26f, Color.FromArgb(255, 255, 220, 120), Font.ChaletLondon).Draw();
+                            break; // don't fill yet - hose still on its way down
+                        }
+
+                        // hose fully attached at the fuel cap - draw it locked in place
                         DrawFuelHose(hoseStart, hoseEnd, Color.FromArgb(230, 255, 200, 60));
 
                         _deliveryFillProgress += Game.LastFrameTime / HOVER_DURATION_SECONDS;
@@ -1042,6 +1072,17 @@ namespace SaifFuelMod
             }
         }
 
+        // Approximates the vehicle's fuel cap as a point at the rear of the
+        // vehicle, offset to whichever side real GTA fuel caps usually sit
+        // on, so the hose visibly plugs into the back/side of the car
+        // instead of floating over its center/roof.
+        private Vector3 GetFuelCapPosition(Vehicle veh)
+        {
+            Vector3 rearCenter = veh.Position - (veh.ForwardVector * (veh.Model.GetDimensions().Y * 0.5f));
+            Vector3 sideOffset = veh.RightVector * (veh.Model.GetDimensions().X * 0.35f);
+            return rearCenter + sideOffset + new Vector3(0, 0, 0.4f);
+        }
+
         // Projects a world point to screen space (0-1 normalized -> pixels).
         private bool WorldToScreen(Vector3 world, out float screenX, out float screenY)
         {
@@ -1055,10 +1096,17 @@ namespace SaifFuelMod
 
         // Draws a dotted "hose/pipe" line on screen between two world points -
         // used to show fuel visibly flowing from the heli down to the player.
+        // If one end is off-screen it's clamped to the nearest screen edge
+        // instead of skipping the draw entirely, so the hose doesn't just
+        // vanish when the camera angle clips one end off-screen.
         private void DrawFuelHose(Vector3 fromWorld, Vector3 toWorld, Color color)
         {
-            if (!WorldToScreen(fromWorld, out float x1, out float y1)) return;
-            if (!WorldToScreen(toWorld, out float x2, out float y2)) return;
+            bool onA = WorldToScreen(fromWorld, out float x1, out float y1);
+            bool onB = WorldToScreen(toWorld, out float x2, out float y2);
+            if (!onA && !onB) return; // both ends off-screen, nothing sensible to draw
+
+            if (!onA) { x1 = x2; y1 = 0f; }
+            if (!onB) { x2 = x1; y2 = Screen.Height; }
 
             const int SEGMENTS = 16;
             for (int i = 0; i <= SEGMENTS; i++)
