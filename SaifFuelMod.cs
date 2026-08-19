@@ -558,7 +558,7 @@ namespace SaifFuelMod
         {
             if (veh == null || !veh.Exists()) return;
             float pct = _maxFuel > 0f ? _fuel / _maxFuel : 0f;
-            Function.Call(Hash.SET_VEHICLE_FUEL_LEVEL, veh, pct * 100f);
+            Function.Call(Hash._SET_VEHICLE_FUEL_LEVEL, veh, pct * 100f);
         }
 
         private float GetTankSize(Vehicle veh)
