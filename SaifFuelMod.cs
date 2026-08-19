@@ -212,6 +212,7 @@ namespace SaifFuelMod
         private NativeListItem<int> _hudOffsetYItem;
         private NativeListItem<float> _hudScaleItem;
         private NativeItem _hudSetExactItem;
+        private NativeItem _hudMoveLiveItem;
 
         public FuelMod()
         {
@@ -318,6 +319,7 @@ namespace SaifFuelMod
             _hudScaleItem.ItemChanged += (s, e) => _hudScale = _hudScaleItem.SelectedItem;
 
             _hudSetExactItem = new NativeItem("Set HUD Position/Size...", "Type exact X,Y,Scale (e.g. 285,-260,1.0)");
+            _hudMoveLiveItem = new NativeItem("Move HUD (Live)...", "Arrow keys to move, +/- to resize, Enter to confirm");
 
             _settingsMenu.Add(_fuelRateItem);
             _settingsMenu.Add(_refuelSpeedItem);
@@ -328,6 +330,7 @@ namespace SaifFuelMod
             _settingsMenu.Add(_hudOffsetYItem);
             _settingsMenu.Add(_hudScaleItem);
             _settingsMenu.Add(_hudSetExactItem);
+            _settingsMenu.Add(_hudMoveLiveItem);
             _settingsMenu.ItemActivated += SettingsMenu_ItemActivated;
             _pool.Add(_settingsMenu);
         }
@@ -343,6 +346,59 @@ namespace SaifFuelMod
         private void SettingsMenu_ItemActivated(object sender, ItemActivatedArgs e)
         {
             if (e.Item == _hudSetExactItem) SetHudExact();
+            else if (e.Item == _hudMoveLiveItem) StartHudLiveMove();
+        }
+
+        // =================================================================
+        // LIVE HUD POSITIONING - trainer/menu-style: closes all menus,
+        // arrow keys nudge X/Y, +/- (or PageUp/PageDown) resize, Enter saves
+        // and exits, Backspace/Escape cancels back to the pre-move position.
+        // =================================================================
+        private bool _hudMoveMode = false;
+        private float _hudMoveRevertX, _hudMoveRevertY, _hudMoveRevertScale;
+
+        private void StartHudLiveMove()
+        {
+            _hudMoveRevertX = _hudOffsetX;
+            _hudMoveRevertY = _hudOffsetY;
+            _hudMoveRevertScale = _hudScale;
+            _hudMoveMode = true;
+            _settingsMenu.Visible = false;
+            ShowToast("~g~Move HUD:~w~ Arrows = move, +/- = resize, Enter = save, Backspace = cancel");
+        }
+
+        private void HandleHudLiveMoveKey(Keys key)
+        {
+            const float step = 12f;
+            switch (key)
+            {
+                case Keys.Left: _hudOffsetX = Math.Max(0f, _hudOffsetX - step); break;
+                case Keys.Right: _hudOffsetX = Math.Min(1800f, _hudOffsetX + step); break;
+                case Keys.Up: _hudOffsetY = Math.Max(-800f, _hudOffsetY - step); break;
+                case Keys.Down: _hudOffsetY = Math.Min(-50f, _hudOffsetY + step); break;
+                case Keys.Oemplus:
+                case Keys.Add:
+                    _hudScale = Math.Min(2.5f, _hudScale + 0.05f); break;
+                case Keys.OemMinus:
+                case Keys.Subtract:
+                    _hudScale = Math.Max(0.4f, _hudScale - 0.05f); break;
+                case Keys.Enter:
+                    _hudMoveMode = false;
+                    SelectClosest(_hudOffsetXItem, (int)_hudOffsetX);
+                    SelectClosest(_hudOffsetYItem, (int)_hudOffsetY);
+                    SelectClosest(_hudScaleItem, _hudScale);
+                    ShowToast($"~g~HUD position saved~w~ ({(int)_hudOffsetX},{(int)_hudOffsetY} @ {_hudScale:F1}x)");
+                    SaveAllData();
+                    break;
+                case Keys.Back:
+                case Keys.Escape:
+                    _hudOffsetX = _hudMoveRevertX;
+                    _hudOffsetY = _hudMoveRevertY;
+                    _hudScale = _hudMoveRevertScale;
+                    _hudMoveMode = false;
+                    ShowToast("~y~HUD move cancelled.");
+                    break;
+            }
         }
 
         // Lets the player type exact "X,Y,Scale" instead of scrolling the
@@ -519,15 +575,21 @@ namespace SaifFuelMod
 
             if (veh.IsEngineRunning)
             {
-                // Usage scales with how hard the vehicle is being driven -
-                // stopped/idling burns very little, high speed burns close to
-                // the max consumption value.
+                // Usage now scales with actual engine load, not just speed:
+                // RPM (how hard the engine is spinning) and throttle input
+                // (how hard the player is pressing the gas) both feed in, so
+                // revving in place or climbing a hill under load burns more
+                // than cruising at the same speed with a light foot.
                 float speedKmh = veh.Speed * 3.6f;
-                float modifier = speedKmh < 5f ? 0.25f : Math.Min(1f, speedKmh / 140f) * 1.0f + (speedKmh > 100f ? -0.2f : 0f);
-                modifier = Math.Max(0.1f, modifier);
+                float speedFactor = speedKmh < 5f ? 0.15f : Math.Min(1f, speedKmh / 140f) * 1.0f + (speedKmh > 100f ? -0.2f : 0f);
+                float rpm = veh.CurrentRPM; // 0-1 in SHVDN
+                float throttle = Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate);
+                float loadFactor = 0.3f + rpm * 0.5f + throttle * 0.4f; // idle still burns a little, WOT burns a lot
+
+                float modifier = Math.Max(0.08f, speedFactor) * loadFactor;
                 if (veh.ClassType == VehicleClass.Sports || veh.ClassType == VehicleClass.Super) modifier *= 1.2f;
                 if (veh.EngineHealth < 700f) modifier *= 1.3f;
-                modifier = Math.Min(modifier, 1.8f) * _fuelConsumeRate;
+                modifier = Math.Min(modifier, 2.2f) * _fuelConsumeRate;
 
                 if (DateTime.Now < _slowConsumptionUntil) modifier *= 0.5f;
 
@@ -940,9 +1002,13 @@ namespace SaifFuelMod
                         Vector3 hoverPos = playerPed.Position + new Vector3(0, 0, 22f);
                         MovePlaneTo(hoverPos, faceDown: true);
 
-                        // hose/pipe visual: dotted line from under the heli down to the player
+                        // hose/pipe visual: dotted line from under the heli down
+                        // to the vehicle itself when the player is in one (looks
+                        // like it's actually attached to the vehicle refueling),
+                        // otherwise down to the player.
+                        Vector3 attachPoint = playerPed.IsInVehicle() ? playerPed.CurrentVehicle.Position : playerPed.Position;
                         Vector3 hoseStart = hoverPos + new Vector3(0, 0, -3f);
-                        Vector3 hoseEnd = playerPed.Position + new Vector3(0, 0, 1f);
+                        Vector3 hoseEnd = attachPoint + new Vector3(0, 0, 1f);
                         DrawFuelHose(hoseStart, hoseEnd, Color.FromArgb(230, 255, 200, 60));
 
                         _deliveryFillProgress += Game.LastFrameTime / HOVER_DURATION_SECONDS;
@@ -1045,60 +1111,84 @@ namespace SaifFuelMod
         private void UpdateHud()
         {
             Ped playerPed = Game.Player.Character;
-            if (!playerPed.IsInVehicle()) return; // no HUD on foot
-            Vehicle veh = playerPed.CurrentVehicle;
-            if (veh == null || !veh.Exists()) return;
+            if (!playerPed.IsInVehicle() && !_hudMoveMode) return; // no HUD on foot, unless actively positioning it
+            Vehicle veh = playerPed.IsInVehicle() ? playerPed.CurrentVehicle : null;
+            if (!_hudMoveMode && (veh == null || !veh.Exists())) return;
 
-            const int SEGMENTS = 10;
-
-            float barHeight = 220f * _hudScale;
-            float barTop = Screen.Height + _hudOffsetY - barHeight; // _hudOffsetY is negative
-            float segGap = 3f;
-            float colW = 26f * _hudScale;
-            float colGap = 8f * _hudScale;
-            float segH = (barHeight - segGap * (SEGMENTS - 1)) / SEGMENTS;
+            float tankHeight = 200f * _hudScale;
+            float tankTop = Screen.Height + _hudOffsetY - tankHeight; // _hudOffsetY is negative
+            float tankW = 34f * _hudScale;
+            float tankGap = 14f * _hudScale;
+            float labelH = 18f * _hudScale;
 
             float panelX = _hudOffsetX;
-            float panelW = colW * 2f + colGap;
-            // shared box for both bars, with room above for the % label
-            new ContainerElement(new PointF(panelX - 6, barTop - 24), new SizeF(panelW + 12, barHeight + 36), Color.FromArgb(160, 0, 0, 0)).Draw();
+            float panelW = tankW * 2f + tankGap;
+            // shared box for both tanks, with room above for % and below for labels
+            new ContainerElement(new PointF(panelX - 8, tankTop - 28), new SizeF(panelW + 16, tankHeight + 28 + labelH + 10), Color.FromArgb(160, 0, 0, 0)).Draw();
 
-            // ---- FUEL (main bar) ----
+            // ---- FUEL TANK ----
             float fuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 0f;
             _displayedFuelPct += (fuelPct - _displayedFuelPct) * Math.Min(1f, Game.LastFrameTime * 2.5f);
             bool fuelLow = fuelPct < 0.2f;
-            DrawHudColumn(panelX, barTop, colW, segH, segGap, SEGMENTS, _displayedFuelPct,
-                Color.LimeGreen, Color.Red, fuelLow);
+            DrawFuelTank(panelX, tankTop, tankW, tankHeight, _displayedFuelPct, Color.LimeGreen, Color.Red, fuelLow);
 
-            // small fuel percentage readout, sits right above the fuel bar
-            string pctText = $"{(int)Math.Round(_displayedFuelPct * 100f)}%";
-            new TextElement(pctText, new PointF(panelX + colW / 2f - 12f, barTop - 22f), 0.28f,
+            string fuelPctText = $"{(int)Math.Round(_displayedFuelPct * 100f)}%";
+            new TextElement(fuelPctText, new PointF(panelX + tankW / 2f - 12f, tankTop - 24f), 0.26f,
                 fuelLow ? Color.Red : Color.White, Font.ChaletLondon).Draw();
+            new TextElement("FUEL", new PointF(panelX + tankW / 2f - 16f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
 
-            // ---- USAGE LINE (vertical, right next to the fuel bar) ----
+            // ---- CONSUMPTION TANK ----
             // Reference ceiling = the highest possible burn rate at the
-            // current consume-rate setting, so the line reads 0 when
-            // stopped and fills toward full at max speed/consumption.
-            float maxLps = (6.5f / 100f) * 1.8f * Math.Max(0.1f, _fuelConsumeRate);
+            // current consume-rate setting, so it reads empty when stopped
+            // and fills toward full under max engine load/speed.
+            float maxLps = (6.5f / 100f) * 2.2f * Math.Max(0.1f, _fuelConsumeRate);
             float usagePct = maxLps > 0f ? Math.Min(1f, _currentUsageLps / maxLps) : 0f;
             _displayedUsagePct += (usagePct - _displayedUsagePct) * Math.Min(1f, Game.LastFrameTime * 4f);
 
-            float usageX = panelX + colW + colGap;
-            DrawHudColumn(usageX, barTop, colW, segH, segGap, SEGMENTS, _displayedUsagePct,
-                Color.FromArgb(255, 255, 180, 40), Color.FromArgb(255, 255, 180, 40), false);
+            float usageX = panelX + tankW + tankGap;
+            Color usageColor = Color.FromArgb(255, 255, 180, 40);
+            DrawFuelTank(usageX, tankTop, tankW, tankHeight, _displayedUsagePct, usageColor, usageColor, false);
+
+            string usagePctText = $"{(int)Math.Round(_displayedUsagePct * 100f)}%";
+            new TextElement(usagePctText, new PointF(usageX + tankW / 2f - 12f, tankTop - 24f), 0.26f, Color.White, Font.ChaletLondon).Draw();
+            new TextElement("USE", new PointF(usageX + tankW / 2f - 12f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
+
+            if (_hudMoveMode)
+            {
+                Color hi = Color.FromArgb(255, 60, 220, 255);
+                float hx = panelX - 8, hy = tankTop - 28, hw = panelW + 16, hh = tankHeight + 28 + labelH + 10;
+                float bw = 3f;
+                new ContainerElement(new PointF(hx, hy), new SizeF(hw, bw), hi).Draw();
+                new ContainerElement(new PointF(hx, hy + hh - bw), new SizeF(hw, bw), hi).Draw();
+                new ContainerElement(new PointF(hx, hy), new SizeF(bw, hh), hi).Draw();
+                new ContainerElement(new PointF(hx + hw - bw, hy), new SizeF(bw, hh), hi).Draw();
+                new TextElement("Arrows: move | +/-: resize | Enter: save | Backspace: cancel",
+                    new PointF(hx, hy + hh + 8f), 0.24f, hi, Font.ChaletLondon).Draw();
+            }
         }
 
-        // Draws one vertical segmented column (bottom-up fill).
-        private void DrawHudColumn(float x, float barTop, float colW, float segH, float segGap, int segments, float pct, Color normalColor, Color lowColor, bool isLow)
+        // Draws a single tank-shaped gauge: an outlined box with one solid
+        // liquid fill level rising from the bottom (like a real fuel tank),
+        // instead of blocky segments.
+        private void DrawFuelTank(float x, float top, float w, float h, float pct, Color normalColor, Color lowColor, bool isLow)
         {
-            int lit = (int)Math.Round(Math.Max(0f, Math.Min(1f, pct)) * segments);
-            for (int i = 0; i < segments; i++)
-            {
-                bool on = i >= (segments - lit);
-                Color c = !on ? Color.FromArgb(150, 45, 45, 45) : (isLow ? lowColor : normalColor);
-                float segY = barTop + i * (segH + segGap);
-                new ContainerElement(new PointF(x, segY), new SizeF(colW, segH), c).Draw();
-            }
+            pct = Math.Max(0f, Math.Min(1f, pct));
+            Color fillColor = isLow ? lowColor : normalColor;
+
+            // tank outline/background
+            new ContainerElement(new PointF(x, top), new SizeF(w, h), Color.FromArgb(150, 30, 30, 30)).Draw();
+
+            // liquid fill, bottom-up
+            float fillH = h * pct;
+            new ContainerElement(new PointF(x, top + (h - fillH)), new SizeF(w, fillH), fillColor).Draw();
+
+            // thin border so it reads as a container, not just a colored block
+            float bw = 2f;
+            Color border = Color.FromArgb(200, 10, 10, 10);
+            new ContainerElement(new PointF(x, top), new SizeF(w, bw), border).Draw();
+            new ContainerElement(new PointF(x, top + h - bw), new SizeF(w, bw), border).Draw();
+            new ContainerElement(new PointF(x, top), new SizeF(bw, h), border).Draw();
+            new ContainerElement(new PointF(x + w - bw, top), new SizeF(bw, h), border).Draw();
         }
 
         // =================================================================
@@ -1494,6 +1584,12 @@ namespace SaifFuelMod
         {
             try
             {
+                if (_hudMoveMode)
+                {
+                    HandleHudLiveMoveKey(e.KeyCode);
+                    return;
+                }
+
                 if (e.KeyCode == Keys.F7)
                 {
                     bool opening = !_settingsMenu.Visible;
