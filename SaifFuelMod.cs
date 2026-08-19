@@ -144,16 +144,13 @@ namespace SaifFuelMod
         private float _priceDiesel = 1.42f;
         private float _pricePremium = 1.65f;
         private float _priceElectric = 0.45f;
-        private const string ConfigPath = "scripts\\SaifFuelMod_config.txt";
+        private const string DataPath = "scripts\\SaifFuelMod_data.txt";
 
         // HUD placement/scale - fully custom position, no preset corners
         private float _hudOffsetX = 285f;
         private float _hudOffsetY = -260f; // negative = measured up from bottom of screen
         private float _hudScale = 1.0f;
-        private const string HudConfigPath = "scripts\\SaifFuelMod_hud.txt";
         private float _displayedFuelPct = 1f; // lerped toward the real value for a live-draining look
-        private float _displayedOilPct = 1f;
-        private float _displayedSpeedPct = 0f;
 
         // =================================================================
         // VEHICLE STATE
@@ -164,7 +161,6 @@ namespace SaifFuelMod
         private const float ENGINE_OIL_MAX = 200f;
         private float _transOil = 250f;
         private const float TRANS_OIL_MAX = 250f;
-        private const string SavePath = "scripts\\SaifFuelMod_save.txt";
         private readonly Dictionary<string, float[]> _savedByPlate = new Dictionary<string, float[]>();
         private int _lastVehicleHandle = -1;
         private bool _radioOn = true;
@@ -189,6 +185,7 @@ namespace SaifFuelMod
         private enum ActiveJob { None, Refuel, ChangeEngineOil, ChangeTransOil, Repair }
         private ActiveJob _activeJob = ActiveJob.None;
         private float _jobTargetFuel = 0f;
+        private float _jobStartValue = 0f;
 
         // Siphoning - progress bar, fills the jerry can, not the vehicle
         private bool _theftInProgress = false;
@@ -235,23 +232,18 @@ namespace SaifFuelMod
         private NativeListItem<int> _hudOffsetXItem;
         private NativeListItem<int> _hudOffsetYItem;
         private NativeListItem<float> _hudScaleItem;
-        private NativeItem _siphonItem;
-        private NativeItem _callDeliveryItem;
+        private NativeItem _hudSetExactItem;
 
         public FuelMod()
         {
             BuildStations();
-            LoadSaveData();
-            LoadConfig();
-            LoadHudConfig();
+            LoadAllData();
             BuildMenus();
 
             Tick += OnTick;
             KeyDown += OnKeyDown;
-            Aborted += (s, e) => { SaveData(); CleanupDelivery(); };
+            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); };
 
-            Notification.Show("~g~Saif Fuel Mod~w~ loaded.");
-            Notification.Show("~y~Approach a pump~w~ - the menu opens on its own. ~b~F7~y~ = settings.");
         }
 
         // =================================================================
@@ -304,7 +296,7 @@ namespace SaifFuelMod
             _engineOilItem = new NativeItem("Engine Oil");
             _transOilItem = new NativeItem("Transmission Oil");
             _repairItem = new NativeItem("Repair Vehicle");
-            _useJerryCanItem = new NativeItem("Use Jerry Can");
+            _useJerryCanItem = new NativeItem("Buy Now, Use Later");
 
             _serviceMenu.Add(_fuelAmountItem);
             _serviceMenu.Add(_customAmountItem);
@@ -361,8 +353,7 @@ namespace SaifFuelMod
             SelectClosest(_hudScaleItem, _hudScale);
             _hudScaleItem.ItemChanged += (s, e) => _hudScale = _hudScaleItem.SelectedItem;
 
-            _siphonItem = new NativeItem("Siphon Nearby Vehicle", "Fills your jerry can, not your tank directly.");
-            _callDeliveryItem = new NativeItem("Call Fuel Delivery", $"${DELIVERY_COST} - a helicopter brings fuel to you.");
+            _hudSetExactItem = new NativeItem("Set HUD Position/Size...", "Type exact X,Y,Scale (e.g. 285,-260,1.0)");
 
             _settingsMenu.Add(_fuelRateItem);
             _settingsMenu.Add(_oilRateItem);
@@ -375,8 +366,7 @@ namespace SaifFuelMod
             _settingsMenu.Add(_hudOffsetXItem);
             _settingsMenu.Add(_hudOffsetYItem);
             _settingsMenu.Add(_hudScaleItem);
-            _settingsMenu.Add(_siphonItem);
-            _settingsMenu.Add(_callDeliveryItem);
+            _settingsMenu.Add(_hudSetExactItem);
             _settingsMenu.ItemActivated += SettingsMenu_ItemActivated;
             _pool.Add(_settingsMenu);
         }
@@ -388,13 +378,41 @@ namespace SaifFuelMod
             else if (e.Item == _engineOilItem) ConfirmEngineOil();
             else if (e.Item == _transOilItem) ConfirmTransOil();
             else if (e.Item == _repairItem) ConfirmRepair();
-            else if (e.Item == _useJerryCanItem) UseJerryCan();
+            else if (e.Item == _useJerryCanItem) BuyNowUseLater();
         }
 
         private void SettingsMenu_ItemActivated(object sender, ItemActivatedArgs e)
         {
-            if (e.Item == _siphonItem) TryStartSiphon();
-            else if (e.Item == _callDeliveryItem) TryCallDelivery();
+            if (e.Item == _hudSetExactItem) SetHudExact();
+        }
+
+        // Lets the player type exact "X,Y,Scale" instead of scrolling the
+        // list items - covers "set wherever I want" + exact fuel bar size.
+        private void SetHudExact()
+        {
+            string input = Game.GetUserInput(WindowTitle.EnterMessage60, $"{(int)_hudOffsetX},{(int)_hudOffsetY},{_hudScale:F1}", 20);
+            if (string.IsNullOrWhiteSpace(input)) return;
+
+            var parts = input.Split(',');
+            if (parts.Length != 3 ||
+                !float.TryParse(parts[0], out float x) ||
+                !float.TryParse(parts[1], out float y) ||
+                !float.TryParse(parts[2], out float scale))
+            {
+                ShowToast("~r~Format must be X,Y,Scale (e.g. 285,-260,1.0)");
+                return;
+            }
+
+            _hudOffsetX = Math.Max(0f, Math.Min(1800f, x));
+            _hudOffsetY = Math.Max(-800f, Math.Min(-50f, y));
+            _hudScale = Math.Max(0.4f, Math.Min(2.5f, scale));
+
+            SelectClosest(_hudOffsetXItem, (int)_hudOffsetX);
+            SelectClosest(_hudOffsetYItem, (int)_hudOffsetY);
+            SelectClosest(_hudScaleItem, _hudScale);
+
+            ShowToast($"~g~HUD set~w~ to {(int)_hudOffsetX},{(int)_hudOffsetY} @ {_hudScale:F1}x");
+            SaveAllData();
         }
 
         // =================================================================
@@ -411,7 +429,7 @@ namespace SaifFuelMod
                     // which call Model.Request() -> Script.Yield() internally. Yielding
                     // is illegal before the script's main loop starts, so spawning is
                     // deferred to the first Tick instead of the constructor.
-                    CreateStationBlipsDeduped();
+                    foreach (var st in _stations) CreateStationBlips(st);
                     _stationsSpawned = true;
                 }
 
@@ -424,10 +442,13 @@ namespace SaifFuelMod
                 UpdateStationStock();
                 UpdatePumpProximity();
                 UpdateActiveJob();
+                UpdateSiphonAutoTrigger();
                 UpdateSiphonProgress();
                 UpdateDelivery();
                 UpdateAmbientVehicles();
                 UpdateAutoJerryCanRefill();
+                UpdateAircraftThreatRadar();
+                DrawToasts();
             }
             catch (Exception ex)
             {
@@ -447,36 +468,65 @@ namespace SaifFuelMod
             _savedByPlate[plate] = new[] { _fuel, _engineOil, _transOil };
         }
 
+        // Every pump gets the SAME blip name + sprite ("Saif Fuel Station").
+        // GTA's own pause-map blip list groups blips that share a name+sprite
+        // into one collapsible row with an arrow you cycle through - this is
+        // what actually links all the pumps under one shared icon on the
+        // right-side list, no custom clustering code needed.
+        private const string SHARED_BLIP_NAME = "Saif Fuel Station";
         private void CreateStationBlips(Station st)
         {
             Vector3 anchor = st.Machines.Values.First();
             Blip b = World.CreateBlip(anchor);
             b.Sprite = BlipSprite.JerryCan;
             b.Color = BlipColor.Green;
-            b.Name = st.Name;
+            b.Name = SHARED_BLIP_NAME;
             b.IsShortRange = true;
-        }
-
-        // Real GTA shops show ONE icon even where several outlets sit side by
-        // side - only place a blip if no earlier station's anchor is already
-        // close by, so stations bunched together don't stack overlapping icons.
-        private const float BLIP_CLUSTER_RADIUS = 60f;
-        private void CreateStationBlipsDeduped()
-        {
-            var placedAnchors = new List<Vector3>();
-            foreach (var st in _stations)
-            {
-                Vector3 anchor = st.Machines.Values.First();
-                bool nearExisting = placedAnchors.Any(p => p.DistanceTo(anchor) < BLIP_CLUSTER_RADIUS);
-                if (nearExisting) continue;
-                CreateStationBlips(st);
-                placedAnchors.Add(anchor);
-            }
+            Function.Call(Hash.SET_BLIP_CATEGORY, b, 7);
         }
 
         // =================================================================
         // TOP-LEFT WARNING TEXT (replaces center-screen subtitles)
         // =================================================================
+        // =================================================================
+        // TOAST NOTIFICATIONS - replaces native GTA.UI.Notification.Show
+        // everywhere in the mod. Styled to match LemonUI's own menu skin
+        // (dark panel, colored left accent, white body text) so every
+        // message - progress, warnings, purchases, everything - looks like
+        // part of the same UI instead of the yellow native notification box.
+        // =================================================================
+        private class Toast { public string Text; public DateTime ExpiresAt; }
+        private readonly List<Toast> _toasts = new List<Toast>();
+        private const int TOAST_DURATION_MS = 3500;
+        private const int MAX_TOASTS = 4;
+
+        private void ShowToast(string text)
+        {
+            // strip GTA's ~r~/~g~/~w~ color tags - we render color via the
+            // panel accent instead, so raw tags would just show as text.
+            string clean = System.Text.RegularExpressions.Regex.Replace(text, "~.~", "");
+            _toasts.Add(new Toast { Text = clean, ExpiresAt = DateTime.Now.AddMilliseconds(TOAST_DURATION_MS) });
+            if (_toasts.Count > MAX_TOASTS) _toasts.RemoveAt(0);
+        }
+
+        private void DrawToasts()
+        {
+            _toasts.RemoveAll(t => DateTime.Now > t.ExpiresAt);
+            if (_toasts.Count == 0) return;
+
+            float w = 340f, h = 44f, gap = 6f;
+            float x = Screen.Width - w - 20f;
+            float y = 20f;
+
+            foreach (var t in _toasts)
+            {
+                new ContainerElement(new PointF(x, y), new SizeF(w, h), Color.FromArgb(215, 25, 25, 25)).Draw();
+                new ContainerElement(new PointF(x, y), new SizeF(4, h), Color.FromArgb(255, 90, 200, 120)).Draw(); // accent bar
+                new TextElement(t.Text, new PointF(x + 14, y + 12), 0.28f, Color.White, Font.ChaletLondon).Draw();
+                y += h + gap;
+            }
+        }
+
         private string _warningText = null;
         private DateTime _warningUntil = DateTime.MinValue;
         private void ShowWarning(string text, int ms)
@@ -667,7 +717,7 @@ namespace SaifFuelMod
             _engineOilItem.Description = $"${(ENGINE_OIL_MAX - _engineOil) * ENGINE_OIL_PRICE_PER_UNIT:F2}";
             _transOilItem.Description = $"${(TRANS_OIL_MAX - _transOil) * TRANS_OIL_PRICE_PER_UNIT:F2}";
             _repairItem.Description = $"${GetRepairCost(veh):F2}";
-            _useJerryCanItem.Description = $"{_jerryCanFuel:F1}L available";
+            _useJerryCanItem.Description = $"Jerry can: {_jerryCanFuel:F1}/{JERRY_CAN_CAPACITY:F0}L stored";
             _serviceMenu.Name = $"{station.Name} ({type})";
 
             if (!_serviceMenu.Visible) _serviceMenu.Visible = true;
@@ -675,7 +725,7 @@ namespace SaifFuelMod
 
         private void ConfirmRefuel(float litres)
         {
-            if (litres <= 0.5f) { Notification.Show("~y~Tank is already full."); return; }
+            if (litres <= 0.5f) { ShowToast("~y~Tank is already full."); return; }
             float cost = litres * GetFuelPrice(_nearFuelType, _nearStation);
             StartJob(ActiveJob.Refuel, cost, "Refueling", litres);
         }
@@ -683,13 +733,13 @@ namespace SaifFuelMod
         private void ConfirmCustomRefuel()
         {
             float space = Math.Max(0f, _maxFuel - _fuel);
-            if (space <= 0.5f) { Notification.Show("~y~Tank is already full."); return; }
+            if (space <= 0.5f) { ShowToast("~y~Tank is already full."); return; }
 
             string input = Game.GetUserInput(WindowTitle.EnterMessage60, $"{(int)space}", 5);
             if (string.IsNullOrWhiteSpace(input)) return;
             if (!float.TryParse(input, out float litres) || litres <= 0f)
             {
-                Notification.Show("~r~Enter a valid number of litres.");
+                ShowToast("~r~Enter a valid number of litres.");
                 return;
             }
 
@@ -700,14 +750,14 @@ namespace SaifFuelMod
         private void ConfirmEngineOil()
         {
             float cost = (ENGINE_OIL_MAX - _engineOil) * ENGINE_OIL_PRICE_PER_UNIT;
-            if (cost <= 0.5f) { Notification.Show("~y~Engine oil is already full."); return; }
+            if (cost <= 0.5f) { ShowToast("~y~Engine oil is already full."); return; }
             StartJob(ActiveJob.ChangeEngineOil, cost, "Changing engine oil", 0);
         }
 
         private void ConfirmTransOil()
         {
             float cost = (TRANS_OIL_MAX - _transOil) * TRANS_OIL_PRICE_PER_UNIT;
-            if (cost <= 0.5f) { Notification.Show("~y~Transmission oil is already full."); return; }
+            if (cost <= 0.5f) { ShowToast("~y~Transmission oil is already full."); return; }
             StartJob(ActiveJob.ChangeTransOil, cost, "Changing transmission oil", 0);
         }
 
@@ -715,30 +765,51 @@ namespace SaifFuelMod
         {
             Vehicle veh = Game.Player.Character.CurrentVehicle;
             float cost = GetRepairCost(veh);
-            if (cost <= 0.5f) { Notification.Show("~y~Your vehicle is in great condition."); return; }
+            if (cost <= 0.5f) { ShowToast("~y~Your vehicle is in great condition."); return; }
             StartJob(ActiveJob.Repair, cost, "Repairing vehicle", 0);
         }
 
-        private void UseJerryCan()
+        // "Buy Now, Use Later" - pay for fuel at today's pump price, but it
+        // goes straight into the jerry can instead of the tank, so it's
+        // banked for whenever you want it. Actual pouring into a vehicle
+        // still happens automatically via the jerry-can proximity system.
+        private void BuyNowUseLater()
         {
-            if (_jerryCanFuel <= 0.2f) { Notification.Show("~y~Jerry can is empty."); return; }
-            float space = Math.Max(0f, _maxFuel - _fuel);
-            float transfer = Math.Min(_jerryCanFuel, space);
-            if (transfer <= 0.2f) { Notification.Show("~y~Tank is already full."); return; }
-            _fuel += transfer;
-            _jerryCanFuel -= transfer;
-            Notification.Show($"~g~Poured {transfer:F1}L~w~ from your jerry can.");
-            SaveData();
+            float space = Math.Max(0f, JERRY_CAN_CAPACITY - _jerryCanFuel);
+            if (space <= 0.2f) { ShowToast("~y~Jerry can is already full."); return; }
+
+            string input = Game.GetUserInput(WindowTitle.EnterMessage60, $"{(int)space}", 5);
+            if (string.IsNullOrWhiteSpace(input)) return;
+            if (!float.TryParse(input, out float litres) || litres <= 0f)
+            {
+                ShowToast("~r~Enter a valid number of litres.");
+                return;
+            }
+
+            litres = Math.Min(litres, space);
+            float cost = litres * GetFuelPrice(_nearFuelType, _nearStation);
+            if (_money < cost) { ShowToast("~r~Your money is not enough."); return; }
+
+            _money -= (int)Math.Round(cost);
+            _jerryCanFuel += litres;
+            ShowToast($"~g~Bought {litres:F1}L~w~ for later (${cost:F2}) - stored in jerry can.");
+            SaveAllData();
         }
 
         private void StartJob(ActiveJob job, float cost, string label, float litres)
         {
-            if (_money < cost) { Notification.Show("~r~Your money is not enough."); return; }
+            if (_money < cost) { ShowToast("~r~Your money is not enough."); return; }
             _money -= (int)Math.Round(cost);
             _activeJob = job;
             _jobTargetFuel = job == ActiveJob.Refuel ? Math.Min(_maxFuel, _fuel + litres) : 0f;
+            Vehicle veh = Game.Player.Character.CurrentVehicle;
+            _jobStartValue = job == ActiveJob.Refuel ? _fuel
+                : job == ActiveJob.ChangeEngineOil ? _engineOil
+                : job == ActiveJob.ChangeTransOil ? _transOil
+                : job == ActiveJob.Repair && veh != null ? veh.EngineHealth
+                : 0f;
             _serviceMenu.Visible = false;
-            Notification.Show($"~g~{label}...~w~ ${cost:F2}");
+            ShowToast($"~g~{label}...~w~ ${cost:F2}");
         }
 
         private void UpdateActiveJob()
@@ -748,24 +819,45 @@ namespace SaifFuelMod
             Vehicle veh = playerPed.IsInVehicle() ? playerPed.CurrentVehicle : null;
             if (veh == null) { _activeJob = ActiveJob.None; return; }
 
+            float jobPct = 0f;
+            string jobLabel = "";
+            Color jobColor = Color.LimeGreen;
+
             switch (_activeJob)
             {
                 case ActiveJob.Refuel:
                     _fuel = Math.Min(_jobTargetFuel, _fuel + _refuelSpeed * Game.LastFrameTime);
-                    if (_fuel >= _jobTargetFuel - 0.05f) { _activeJob = ActiveJob.None; Notification.Show("~g~Refuel complete!"); SaveData(); }
+                    jobPct = _jobTargetFuel > 0f ? Math.Min(1f, (_fuel - _jobStartValue) / Math.Max(0.01f, _jobTargetFuel - _jobStartValue)) : 1f;
+                    jobLabel = "Refueling"; jobColor = Color.LimeGreen;
+                    if (_fuel >= _jobTargetFuel - 0.05f) { _activeJob = ActiveJob.None; ShowToast("~g~Refuel complete!"); SaveAllData(); }
                     break;
                 case ActiveJob.ChangeEngineOil:
                     _engineOil = Math.Min(ENGINE_OIL_MAX, _engineOil + _oilChangeSpeed * Game.LastFrameTime);
-                    if (_engineOil >= ENGINE_OIL_MAX - 0.5f) { _activeJob = ActiveJob.None; Notification.Show("~g~Engine oil changed!"); SaveData(); }
+                    jobPct = Math.Min(1f, (_engineOil - _jobStartValue) / Math.Max(0.01f, ENGINE_OIL_MAX - _jobStartValue));
+                    jobLabel = "Changing engine oil"; jobColor = Color.FromArgb(255, 200, 140, 40);
+                    if (_engineOil >= ENGINE_OIL_MAX - 0.5f) { _activeJob = ActiveJob.None; ShowToast("~g~Engine oil changed!"); SaveAllData(); }
                     break;
                 case ActiveJob.ChangeTransOil:
                     _transOil = Math.Min(TRANS_OIL_MAX, _transOil + _oilChangeSpeed * Game.LastFrameTime);
-                    if (_transOil >= TRANS_OIL_MAX - 0.5f) { _activeJob = ActiveJob.None; Notification.Show("~g~Transmission oil changed!"); SaveData(); }
+                    jobPct = Math.Min(1f, (_transOil - _jobStartValue) / Math.Max(0.01f, TRANS_OIL_MAX - _jobStartValue));
+                    jobLabel = "Changing transmission oil"; jobColor = Color.FromArgb(255, 200, 140, 40);
+                    if (_transOil >= TRANS_OIL_MAX - 0.5f) { _activeJob = ActiveJob.None; ShowToast("~g~Transmission oil changed!"); SaveAllData(); }
                     break;
                 case ActiveJob.Repair:
                     veh.EngineHealth = Math.Min(1000f, veh.EngineHealth + 150f * Game.LastFrameTime);
-                    if (veh.EngineHealth >= 999.5f) { veh.Repair(); _activeJob = ActiveJob.None; Notification.Show("~g~Vehicle repaired!"); }
+                    jobPct = Math.Min(1f, (veh.EngineHealth - _jobStartValue) / Math.Max(0.01f, 1000f - _jobStartValue));
+                    jobLabel = "Repairing vehicle"; jobColor = Color.Cyan;
+                    if (veh.EngineHealth >= 999.5f) { veh.Repair(); _activeJob = ActiveJob.None; ShowToast("~g~Vehicle repaired!"); }
                     break;
+            }
+
+            if (_activeJob != ActiveJob.None)
+            {
+                float barX = 20f, barY = 90f;
+                new ContainerElement(new PointF(barX, barY), new SizeF(300, 30), Color.FromArgb(200, 20, 20, 20)).Draw();
+                new ContainerElement(new PointF(barX + 5, barY + 20), new SizeF(290, 6), Color.FromArgb(150, 60, 60, 60)).Draw();
+                new ContainerElement(new PointF(barX + 5, barY + 20), new SizeF(290 * jobPct, 6), jobColor).Draw();
+                new TextElement($"{jobLabel}... {(int)(jobPct * 100)}%", new PointF(barX + 5, barY + 2), 0.24f, Color.White, Font.ChaletLondon).Draw();
             }
         }
 
@@ -812,32 +904,42 @@ namespace SaifFuelMod
             return false;
         }
 
-        private void TryStartSiphon()
+        // Auto-triggered every tick instead of a menu item: only starts when
+        // the player already has the jerry can equipped AND is standing right
+        // up against a vehicle's fuel cap (tight range, not just "nearby").
+        private void UpdateSiphonAutoTrigger()
         {
+            if (_theftInProgress) return;
             Ped playerPed = Game.Player.Character;
-            if (playerPed.IsInVehicle()) { Notification.Show("~r~Get out of your vehicle first."); return; }
-            if (_jerryCanFuel >= JERRY_CAN_CAPACITY - 0.5f) { Notification.Show("~y~Jerry can is already full."); return; }
+            if (playerPed.IsInVehicle()) return;
+            if (playerPed.Weapons.Current == null || playerPed.Weapons.Current.Hash != WeaponHash.PetrolCan) return;
+            if (_jerryCanFuel >= JERRY_CAN_CAPACITY - 0.5f) return;
 
             Vehicle nearest = null;
-            float bestDist = 4.0f;
-            foreach (Vehicle v in World.GetNearbyVehicles(playerPed.Position, 4.0f))
+            float bestDist = 1.6f; // right at the fuel cap, not just "nearby"
+            foreach (Vehicle v in World.GetNearbyVehicles(playerPed.Position, 1.6f))
             {
                 if (v == null || !v.Exists() || v == playerPed.CurrentVehicle) continue;
                 if (v.Driver != null && v.Driver.Exists() && !v.Driver.IsDead) continue;
                 float d = v.Position.DistanceTo(playerPed.Position);
                 if (d < bestDist) { bestDist = d; nearest = v; }
             }
+            if (nearest == null) return;
 
-            if (nearest == null) { Notification.Show("~r~No parked vehicle nearby."); return; }
+            TryStartSiphon(nearest);
+        }
+
+        private void TryStartSiphon(Vehicle nearest)
+        {
+            Ped playerPed = Game.Player.Character;
 
             _theftTarget = nearest;
             _theftInProgress = true;
             _theftProgress = 0f;
 
             Function.Call(Hash.TASK_TURN_PED_TO_FACE_ENTITY, playerPed, nearest, 1500);
-            playerPed.Weapons.Give(WeaponHash.PetrolCan, 1, true, true); // real jerry can weapon, visible in-hand
             playerPed.Task.PlayAnimation("amb@prop_human_parking_meter@male@base", "base", 8.0f, -1, AnimationFlags.Loop);
-            Notification.Show("~y~Siphoning fuel...~w~ hold still.");
+            ShowToast("~y~Siphoning fuel...~w~ hold still.");
         }
 
         private void UpdateSiphonProgress()
@@ -850,8 +952,7 @@ namespace SaifFuelMod
             {
                 _theftInProgress = false;
                 playerPed.Task.ClearAll();
-                playerPed.Weapons.Remove(WeaponHash.PetrolCan);
-                Notification.Show("~r~Siphoning interrupted.");
+                ShowToast("~r~Siphoning interrupted.");
                 return;
             }
 
@@ -867,19 +968,18 @@ namespace SaifFuelMod
             {
                 _theftInProgress = false;
                 playerPed.Task.ClearAll();
-                playerPed.Weapons.Remove(WeaponHash.PetrolCan);
 
                 float stolen = Math.Min(JERRY_CAN_CAPACITY - _jerryCanFuel, 5f + (float)Rand.NextDouble() * 10f);
                 _jerryCanFuel += Math.Max(0f, stolen);
-                Notification.Show($"~g~Siphoned {stolen:F1}L~w~ into your jerry can.");
+                ShowToast($"~g~Siphoned {stolen:F1}L~w~ into your jerry can.");
 
                 if (WasSeenByWitness(playerPed))
                 {
                     Function.Call(Hash.SET_PLAYER_WANTED_LEVEL, Game.Player, 1, false);
                     Function.Call(Hash.SET_PLAYER_WANTED_LEVEL_NOW, Game.Player, false);
-                    Notification.Show("~r~Someone saw you!");
+                    ShowToast("~r~Someone saw you!");
                 }
-                SaveData();
+                SaveAllData();
             }
         }
 
@@ -896,8 +996,8 @@ namespace SaifFuelMod
 
         private void TryCallDelivery()
         {
-            if (_deliveryPhase != DeliveryPhase.None) { Notification.Show("~y~A delivery is already on its way."); return; }
-            if (_money < DELIVERY_COST) { Notification.Show($"~r~Not enough money (${DELIVERY_COST})."); return; }
+            if (_deliveryPhase != DeliveryPhase.None) { ShowToast("~y~A delivery is already on its way."); return; }
+            if (_money < DELIVERY_COST) { ShowToast($"~r~Not enough money (${DELIVERY_COST})."); return; }
 
             Ped playerPed = Game.Player.Character;
 
@@ -913,7 +1013,7 @@ namespace SaifFuelMod
             _deliveryStartPos = _deliveryTargetPos + (playerPed.ForwardVector * -500f) + new Vector3(0, 0, 60f);
 
             _deliveryPlane = World.CreateVehicle(VehicleHash.Maverick, _deliveryStartPos, 0f);
-            if (_deliveryPlane == null) { Notification.Show("~r~Delivery failed to launch."); return; }
+            if (_deliveryPlane == null) { ShowToast("~r~Delivery failed to launch."); return; }
             _deliveryPlane.IsPersistent = true;
             _deliveryPlane.IsPositionFrozen = true; // we drive this one by hand, not the physics/AI
             MovePlaneTo(_deliveryStartPos, faceDown: true); // face the target immediately instead of spawning sideways-on
@@ -935,7 +1035,7 @@ namespace SaifFuelMod
             _deliveryPhase = DeliveryPhase.Inbound;
             _deliveryFlightT = 0f;
             _deliveryFillProgress = 0f;
-            Notification.Show($"~g~Fuel delivery dispatched~w~ (${DELIVERY_COST}). Watch the sky above you.");
+            ShowToast($"~g~Fuel delivery dispatched~w~ (${DELIVERY_COST}). Watch the sky above you.");
         }
 
         private void UpdateDelivery()
@@ -1000,8 +1100,8 @@ namespace SaifFuelMod
 
                         if (_deliveryFillProgress >= 1f)
                         {
-                            Notification.Show(_deliveryToTankDirect ? "~g~Tank filled by air delivery!" : "~g~Jerry can filled by air delivery!");
-                            SaveData();
+                            ShowToast(_deliveryToTankDirect ? "~g~Tank filled by air delivery!" : "~g~Jerry can filled by air delivery!");
+                            SaveAllData();
                             _deliveryPhase = DeliveryPhase.Leaving;
                             _deliveryFlightT = 0f;
                         }
@@ -1056,11 +1156,13 @@ namespace SaifFuelMod
             Vector3 dir = faceDown ? (_deliveryTargetPos - pos) : (pos - _deliveryPlane.Position);
             if (dir.Length() > 0.01f)
             {
-                // NOTE: this previously had an extra "* -1f + 90f" on top of the
-                // standard Atan2(x,y) conversion, which rotated the heading off by
-                // up to 180 degrees - that's why it looked like it was facing
-                // backwards while flying toward the player.
-                float heading = (float)(Math.Atan2(dir.X, dir.Y) * (180.0 / Math.PI));
+                // NOTE: GTA heading 0 = facing +Y (north), and increases
+                // clockwise toward +X. Forward vector relation is
+                // forward.X = -sin(heading), forward.Y = cos(heading), so the
+                // correct inverse is atan2(-dir.X, dir.Y). Previous formula
+                // was mirrored on X (atan2(dir.X, dir.Y)), which is why the
+                // heli looked like it was facing sideways while approaching.
+                float heading = (float)(Math.Atan2(-dir.X, dir.Y) * (180.0 / Math.PI));
                 if (heading < 0) heading += 360f;
                 _deliveryPlane.Heading = heading;
             }
@@ -1089,46 +1191,25 @@ namespace SaifFuelMod
             if (veh == null || !veh.Exists()) return;
 
             const int SEGMENTS = 10;
-            const float MAX_SPEED_KMH = 240f;
 
             float barHeight = 220f * _hudScale;
             float barTop = Screen.Height + _hudOffsetY - barHeight; // _hudOffsetY is negative
             float segGap = 3f;
             float colW = 26f * _hudScale;
-            float colGap = 8f * _hudScale;
             float segH = (barHeight - segGap * (SEGMENTS - 1)) / SEGMENTS;
 
-            // shared backing panel wide enough for all 3 columns
-            float panelW = colW * 3f + colGap * 2f;
             float panelX = _hudOffsetX;
-            new ContainerElement(new PointF(panelX - 6, barTop - 6), new SizeF(panelW + 12, barHeight + 12), Color.FromArgb(160, 0, 0, 0)).Draw();
+            new ContainerElement(new PointF(panelX - 6, barTop - 6), new SizeF(colW + 12, barHeight + 12), Color.FromArgb(160, 0, 0, 0)).Draw();
 
-            // ---- Column 1: FUEL ----
+            // ---- FUEL (only) ----
             float fuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 0f;
             _displayedFuelPct += (fuelPct - _displayedFuelPct) * Math.Min(1f, Game.LastFrameTime * 2.5f);
             bool fuelLow = fuelPct < 0.2f;
             DrawHudColumn(panelX, barTop, colW, segH, segGap, SEGMENTS, _displayedFuelPct,
                 Color.LimeGreen, Color.Red, fuelLow);
-
-            // ---- Column 2: OIL (worse of engine/trans oil, as %) ----
-            float oilPct = Math.Min(_engineOil / ENGINE_OIL_MAX, _transOil / TRANS_OIL_MAX);
-            _displayedOilPct += (oilPct - _displayedOilPct) * Math.Min(1f, Game.LastFrameTime * 2.5f);
-            bool oilLow = oilPct < 0.2f;
-            float col2X = panelX + colW + colGap;
-            DrawHudColumn(col2X, barTop, colW, segH, segGap, SEGMENTS, _displayedOilPct,
-                Color.FromArgb(255, 200, 140, 40), Color.Red, oilLow);
-
-            // ---- Column 3: SPEED (vertical, fills bottom-up like the others) ----
-            float speedKmh = veh.Speed * 3.6f;
-            float speedPct = Math.Min(1f, speedKmh / MAX_SPEED_KMH);
-            _displayedSpeedPct += (speedPct - _displayedSpeedPct) * Math.Min(1f, Game.LastFrameTime * 6f);
-            float col3X = panelX + (colW + colGap) * 2f;
-            DrawHudColumn(col3X, barTop, colW, segH, segGap, SEGMENTS, _displayedSpeedPct,
-                Color.Cyan, Color.Cyan, false);
         }
 
-        // Draws one vertical segmented column (bottom-up fill) - shared by
-        // fuel/oil/speed so all three read the same way.
+        // Draws one vertical segmented column (bottom-up fill).
         private void DrawHudColumn(float x, float barTop, float colW, float segH, float segGap, int segments, float pct, Color normalColor, Color lowColor, bool isLow)
         {
             int lit = (int)Math.Round(Math.Max(0f, Math.Min(1f, pct)) * segments);
@@ -1142,6 +1223,103 @@ namespace SaifFuelMod
         }
 
         // =================================================================
+        // AIRCRAFT THREAT RADAR - enemy fighter jet detector + guided
+        // missile lock warning, active only while flying a plane/helicopter.
+        // Heuristic-based: GTA doesn't expose a direct "incoming missile"
+        // native, so a hostile aircraft is flagged as a lock threat once it
+        // is close AND pointed roughly at the player (within the missile's
+        // realistic engagement cone) - the same signal real lock-warning
+        // systems key off in-game.
+        // =================================================================
+        private const float THREAT_SCAN_RADIUS = 900f;
+        private const float MISSILE_LOCK_RANGE = 350f;
+        private const float MISSILE_LOCK_CONE_DOT = 0.90f; // ~25 degrees
+        private DateTime _lastThreatBeep = DateTime.MinValue;
+
+        private void UpdateAircraftThreatRadar()
+        {
+            Ped playerPed = Game.Player.Character;
+            if (!playerPed.IsInVehicle()) return;
+            Vehicle myVeh = playerPed.CurrentVehicle;
+            if (myVeh.ClassType != VehicleClass.Planes && myVeh.ClassType != VehicleClass.Helicopters) return;
+
+            var threats = new List<(Vehicle veh, float dist, bool locking)>();
+            bool anyLock = false;
+
+            foreach (Vehicle v in World.GetNearbyVehicles(myVeh.Position, THREAT_SCAN_RADIUS))
+            {
+                if (v == null || !v.Exists() || v == myVeh) continue;
+                if (v.ClassType != VehicleClass.Planes && v.ClassType != VehicleClass.Helicopters) continue;
+                Ped driver = v.Driver;
+                if (driver == null || !driver.Exists() || driver.IsDead) continue;
+
+                // hostile = actively in combat and targeting us, or a
+                // wanted-level military response unit (Hunter/Lazer etc.)
+                bool hostile = Function.Call<bool>(Hash.IS_PED_IN_COMBAT, driver, playerPed);
+                if (!hostile) continue;
+
+                float dist = v.Position.DistanceTo(myVeh.Position);
+                Vector3 toMe = (myVeh.Position - v.Position).Normalized;
+                float aim = Vector3.Dot(v.ForwardVector, toMe);
+                bool locking = dist <= MISSILE_LOCK_RANGE && aim >= MISSILE_LOCK_CONE_DOT;
+
+                threats.Add((v, dist, locking));
+                if (locking) anyLock = true;
+            }
+
+            DrawThreatRadar(myVeh, threats);
+
+            if (anyLock)
+            {
+                new TextElement("~r~MISSILE LOCK WARNING", new PointF(Screen.Width / 2f - 140, 40), 0.5f, Color.Red, Font.ChaletComprimeCologne, GTA.UI.Alignment.Left, true, true).Draw();
+                if ((DateTime.Now - _lastThreatBeep).TotalMilliseconds > 700)
+                {
+                    _lastThreatBeep = DateTime.Now;
+                    Function.Call(Hash.PLAY_SOUND_FRONTEND, -1, "5_SEC_WARNING", "MP_LEADERBOARD_SOUNDSET", false);
+                }
+            }
+        }
+
+        // Small top-right radar circle: player at center, hostile aircraft
+        // plotted as dots rotated relative to the player's heading, red for
+        // an active missile-lock threat, yellow otherwise.
+        private void DrawThreatRadar(Vehicle myVeh, List<(Vehicle veh, float dist, bool locking)> threats)
+        {
+            float radius = 70f;
+            float cx = Screen.Width - 110f;
+            float cy = 140f;
+
+            new ContainerElement(new PointF(cx - radius - 6, cy - radius - 6), new SizeF(radius * 2 + 12, radius * 2 + 12), Color.FromArgb(160, 0, 0, 0)).Draw();
+            new ContainerElement(new PointF(cx - 2, cy - 2), new SizeF(4, 4), Color.White).Draw(); // player dot, always centered
+
+            if (threats.Count == 0)
+            {
+                new TextElement("No threats", new PointF(cx - 40, cy + radius + 6), 0.22f, Color.FromArgb(200, 180, 180, 180), Font.ChaletLondon).Draw();
+                return;
+            }
+
+            float myHeadingRad = myVeh.Heading * (float)(Math.PI / 180.0);
+            foreach (var t in threats)
+            {
+                Vector3 rel = t.veh.Position - myVeh.Position;
+                // rotate relative position into player-heading-relative space
+                float rx = rel.X * (float)Math.Cos(-myHeadingRad) - rel.Y * (float)Math.Sin(-myHeadingRad);
+                float ry = rel.X * (float)Math.Sin(-myHeadingRad) + rel.Y * (float)Math.Cos(-myHeadingRad);
+
+                float scale = Math.Min(1f, t.dist / THREAT_SCAN_RADIUS);
+                float px = cx + rx * (radius / THREAT_SCAN_RADIUS) / Math.Max(0.15f, scale) * scale; // clamp near center for close threats
+                float py = cy - ry * (radius / THREAT_SCAN_RADIUS) / Math.Max(0.15f, scale) * scale;
+                px = Math.Max(cx - radius, Math.Min(cx + radius, px));
+                py = Math.Max(cy - radius, Math.Min(cy + radius, py));
+
+                Color dotColor = t.locking ? Color.Red : Color.Yellow;
+                new ContainerElement(new PointF(px - 4, py - 4), new SizeF(8, 8), dotColor).Draw();
+            }
+
+            new TextElement($"{threats.Count} hostile aircraft", new PointF(cx - 55, cy + radius + 6), 0.22f, Color.FromArgb(220, 255, 120, 120), Font.ChaletLondon).Draw();
+        }
+
+        // =================================================================
         // RADIO TOGGLE (X)
         // =================================================================
         private void ToggleRadio()
@@ -1151,7 +1329,7 @@ namespace SaifFuelMod
             Vehicle veh = playerPed.CurrentVehicle;
             _radioOn = !_radioOn;
             Function.Call(Hash.SET_VEHICLE_RADIO_ENABLED, veh, _radioOn);
-            Notification.Show(_radioOn ? "~g~Radio on" : "~y~Radio off");
+            ShowToast(_radioOn ? "~g~Radio on" : "~y~Radio off");
         }
 
         // =================================================================
@@ -1195,31 +1373,74 @@ namespace SaifFuelMod
         }
 
         // =================================================================
-        // PERSISTENCE
+        // PERSISTENCE - all state (vehicle save data, config, HUD position)
+        // now lives in ONE file instead of three, split by [SECTION] markers.
         // =================================================================
-        private void LoadSaveData()
+        private void LoadAllData()
         {
             try
             {
-                if (!File.Exists(SavePath)) return;
-                foreach (var line in File.ReadAllLines(SavePath))
+                if (!File.Exists(DataPath)) return;
+                string section = "";
+                foreach (var raw in File.ReadAllLines(DataPath))
                 {
-                    var parts = line.Split('|');
-                    if (parts.Length == 5 &&
-                        float.TryParse(parts[1], out float f) &&
-                        float.TryParse(parts[2], out float eo) &&
-                        float.TryParse(parts[3], out float to) &&
-                        float.TryParse(parts[4], out float jc))
+                    string line = raw.Trim();
+                    if (line.Length == 0) continue;
+                    if (line.StartsWith("[") && line.EndsWith("]")) { section = line; continue; }
+
+                    switch (section)
                     {
-                        _savedByPlate[parts[0]] = new[] { f, eo, to };
-                        _jerryCanFuel = jc; // global, not per-vehicle
+                        case "[SAVE]":
+                            {
+                                var parts = line.Split('|');
+                                if (parts.Length == 5 &&
+                                    float.TryParse(parts[1], out float f) &&
+                                    float.TryParse(parts[2], out float eo) &&
+                                    float.TryParse(parts[3], out float to) &&
+                                    float.TryParse(parts[4], out float jc))
+                                {
+                                    _savedByPlate[parts[0]] = new[] { f, eo, to };
+                                    _jerryCanFuel = jc; // global, not per-vehicle
+                                }
+                                break;
+                            }
+                        case "[CONFIG]":
+                            {
+                                var parts = line.Split('|');
+                                if (parts.Length >= 8)
+                                {
+                                    _fuelConsumeRate = float.Parse(parts[0]);
+                                    _oilConsumeRate = float.Parse(parts[1]);
+                                    _refuelSpeed = float.Parse(parts[2]);
+                                    _oilChangeSpeed = float.Parse(parts[3]);
+                                    _oilAffectsEngine = parts[4] == "true";
+                                    _priceRegular = float.Parse(parts[5]);
+                                    _priceDiesel = float.Parse(parts[6]);
+                                    _pricePremium = float.Parse(parts[7]);
+                                }
+                                break;
+                            }
+                        case "[HUD]":
+                            {
+                                var parts = line.Split('|');
+                                if (parts.Length >= 3)
+                                {
+                                    _hudOffsetX = float.Parse(parts[0]);
+                                    _hudOffsetY = float.Parse(parts[1]);
+                                    _hudScale = float.Parse(parts[2]);
+                                }
+                                break;
+                            }
                     }
                 }
             }
             catch (Exception ex) { Log("Load error: " + ex.Message); }
         }
 
-        private void SaveData()
+        // Writes the whole combined file every time - called from all the
+        // same places SaveAllData()/SaveConfig()/SaveHudConfig() used to be
+        // called from, so nothing else needs to change at the call sites.
+        private void SaveAllData()
         {
             try
             {
@@ -1231,8 +1452,20 @@ namespace SaifFuelMod
                         _savedByPlate[plate] = new[] { _fuel, _engineOil, _transOil };
                 }
 
-                var lines = _savedByPlate.Select(kv => $"{kv.Key}|{kv.Value[0]:F1}|{kv.Value[1]:F1}|{kv.Value[2]:F1}|{_jerryCanFuel:F1}");
-                File.WriteAllLines(SavePath, lines);
+                var lines = new List<string> { "[SAVE]" };
+                lines.AddRange(_savedByPlate.Select(kv => $"{kv.Key}|{kv.Value[0]:F1}|{kv.Value[1]:F1}|{kv.Value[2]:F1}|{_jerryCanFuel:F1}"));
+
+                lines.Add("[CONFIG]");
+                lines.Add(string.Join("|",
+                    _fuelConsumeRate.ToString("F2"), _oilConsumeRate.ToString("F2"),
+                    _refuelSpeed.ToString("F1"), _oilChangeSpeed.ToString("F0"),
+                    _oilAffectsEngine.ToString().ToLower(),
+                    _priceRegular.ToString("F2"), _priceDiesel.ToString("F2"), _pricePremium.ToString("F2")));
+
+                lines.Add("[HUD]");
+                lines.Add($"{_hudOffsetX:F0}|{_hudOffsetY:F0}|{_hudScale:F1}");
+
+                File.WriteAllLines(DataPath, lines);
             }
             catch (Exception ex) { Log("Save error: " + ex.Message); }
         }
@@ -1263,76 +1496,13 @@ namespace SaifFuelMod
             }
 
             _displayedFuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 1f;
-            _displayedOilPct = Math.Min(_engineOil / ENGINE_OIL_MAX, _transOil / TRANS_OIL_MAX);
             _radioOn = true;
         }
 
-        private void LoadConfig()
-        {
-            try
-            {
-                if (!File.Exists(ConfigPath)) return;
-                var lines = File.ReadAllLines(ConfigPath);
-                if (lines.Length >= 8)
-                {
-                    _fuelConsumeRate = float.Parse(lines[0]);
-                    _oilConsumeRate = float.Parse(lines[1]);
-                    _refuelSpeed = float.Parse(lines[2]);
-                    _oilChangeSpeed = float.Parse(lines[3]);
-                    _oilAffectsEngine = lines[4] == "true";
-                    _priceRegular = float.Parse(lines[5]);
-                    _priceDiesel = float.Parse(lines[6]);
-                    _pricePremium = float.Parse(lines[7]);
-                }
-            }
-            catch (Exception ex) { Log("Config load error: " + ex.Message); }
-        }
-
-        private void SaveConfig()
-        {
-            try
-            {
-                var lines = new[]
-                {
-                    _fuelConsumeRate.ToString("F2"), _oilConsumeRate.ToString("F2"),
-                    _refuelSpeed.ToString("F1"), _oilChangeSpeed.ToString("F0"),
-                    _oilAffectsEngine.ToString().ToLower(),
-                    _priceRegular.ToString("F2"), _priceDiesel.ToString("F2"), _pricePremium.ToString("F2")
-                };
-                File.WriteAllLines(ConfigPath, lines);
-            }
-            catch (Exception ex) { Log("Config save error: " + ex.Message); }
-        }
-
-        private void LoadHudConfig()
-        {
-            try
-            {
-                if (!File.Exists(HudConfigPath)) return;
-                var lines = File.ReadAllLines(HudConfigPath);
-                if (lines.Length >= 3)
-                {
-                    _hudOffsetX = float.Parse(lines[0]);
-                    _hudOffsetY = float.Parse(lines[1]);
-                    _hudScale = float.Parse(lines[2]);
-                }
-            }
-            catch (Exception ex) { Log("HUD config load error: " + ex.Message); }
-        }
-
-        private void SaveHudConfig()
-        {
-            try
-            {
-                var lines = new[] { _hudOffsetX.ToString("F0"), _hudOffsetY.ToString("F0"), _hudScale.ToString("F1") };
-                File.WriteAllLines(HudConfigPath, lines);
-            }
-            catch (Exception ex) { Log("HUD config save error: " + ex.Message); }
-        }
-
         // =================================================================
-        // KEY HANDLING - just F7 (settings) and X (radio); menus themselves
-        // are driven entirely by arrow keys + Enter via LemonUI.
+        // KEY HANDLING - F7 (settings), X (radio), E (jerry can top-up),
+        // H (call fuel delivery). Menus themselves are driven entirely by
+        // arrow keys + Enter via LemonUI.
         // =================================================================
         private void OnKeyDown(object sender, KeyEventArgs e)
         {
@@ -1342,7 +1512,7 @@ namespace SaifFuelMod
                 {
                     bool opening = !_settingsMenu.Visible;
                     _settingsMenu.Visible = opening;
-                    if (!opening) { SaveConfig(); SaveHudConfig(); }
+                    if (!opening) { SaveAllData(); }
                     return;
                 }
 
@@ -1350,6 +1520,7 @@ namespace SaifFuelMod
 
                 if (e.KeyCode == Keys.X) ToggleRadio();
                 else if (e.KeyCode == Keys.E) TryQuickJerryCanRefill();
+                else if (e.KeyCode == Keys.H) TryCallDelivery();
             }
             catch (Exception ex) { Log("OnKeyDown error: " + ex.Message); }
         }
@@ -1400,13 +1571,13 @@ namespace SaifFuelMod
             float maxFuelForThis = GetTankSize(nearest);
             float space = Math.Max(0f, maxFuelForThis - saved[0]);
             float transfer = Math.Min(_jerryCanFuel, space);
-            if (transfer <= 0.2f) { if (notifyIfFull) Notification.Show("~y~That tank is already full."); return; }
+            if (transfer <= 0.2f) { if (notifyIfFull) ShowToast("~y~That tank is already full."); return; }
 
             saved[0] += transfer;
             _jerryCanFuel -= transfer;
             if (nearest.Handle == _lastVehicleHandle) _fuel = saved[0]; // currently-tracked vehicle, keep in sync
-            Notification.Show($"~g~Poured {transfer:F1}L~w~ from your jerry can.");
-            SaveData();
+            ShowToast($"~g~Poured {transfer:F1}L~w~ from your jerry can.");
+            SaveAllData();
         }
 
         private static void Log(string msg)
