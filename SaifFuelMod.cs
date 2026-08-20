@@ -218,14 +218,25 @@ namespace SaifFuelMod
 
         public FuelMod()
         {
-            BuildStations();
-            LoadAllData();
-            BuildMenus();
+            try
+            {
+                BuildStations();
+                LoadAllData();
+                BuildMenus();
+            }
+            catch (Exception ex)
+            {
+                // If ANY of the above throws (e.g. a leftover/corrupt save
+                // file from an older version of the mod), the whole script
+                // previously died silently with nothing visible in-game -
+                // that's the classic "mod doesn't work at all" symptom.
+                // Now it's logged and Tick/KeyDown still get hooked below.
+                Log("FuelMod() init error: " + ex.Message + "\r\n" + ex.StackTrace);
+            }
 
             Tick += OnTick;
             KeyDown += OnKeyDown;
             Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); ClearPlayerMissiles(); ClearFlares(); };
-
         }
 
         // =================================================================
@@ -437,6 +448,7 @@ namespace SaifFuelMod
         // =================================================================
         private void OnTick(object sender, EventArgs e)
         {
+            if (_pool == null) return; // BuildMenus() failed in the constructor - see the log file for why
             try
             {
                 if (!_stationsSpawned)
