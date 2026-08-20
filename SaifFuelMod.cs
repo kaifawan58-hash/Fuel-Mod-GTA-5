@@ -143,9 +143,9 @@ namespace SaifFuelMod
         private const string DataPath = "scripts\\SaifFuelMod_data.txt";
 
         // HUD placement/scale - fully custom position, no preset corners
-        private float _hudOffsetX = 285f;
-        private float _hudOffsetY = -260f; // negative = measured up from bottom of screen
-        private float _hudScale = 1.0f;
+        private float _hudOffsetX = 1220f;
+        private float _hudOffsetY = -50f; // negative = measured up from bottom of screen
+        private float _hudScale = 0.6f;
         private float _displayedFuelPct = 1f; // lerped toward the real value for a live-draining look
         private float _displayedUsagePct = 0f; // lerped current fuel-burn rate, for the usage line
 
@@ -165,6 +165,8 @@ namespace SaifFuelMod
         private static readonly Random Rand = new Random();
 
         private DateTime _slowConsumptionUntil = DateTime.MinValue;
+        private DateTime _engineStartTime = DateTime.MinValue;
+        private bool _wasEngineRunning = false;
         private bool _stationsSpawned = false;
         private DateTime _lastStockCheck = DateTime.MinValue;
 
@@ -222,7 +224,7 @@ namespace SaifFuelMod
 
             Tick += OnTick;
             KeyDown += OnKeyDown;
-            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); ClearPlayerMissiles(); };
+            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); ClearPlayerMissiles(); ClearFlares(); };
 
         }
 
@@ -575,22 +577,43 @@ namespace SaifFuelMod
 
             if (veh.IsEngineRunning)
             {
-                // Load (RPM + throttle) and speed now contribute
-                // INDEPENDENTLY instead of one flooring the other out -
-                // revving hard while stationary/climbing a hill visibly
-                // burns more even at low speed, not just "faster = more".
+                if (!_wasEngineRunning) _engineStartTime = DateTime.Now;
+                _wasEngineRunning = true;
+
                 float speedKmh = veh.Speed * 3.6f;
-                float speedFactor = 0.3f + Math.Min(1f, speedKmh / 140f) * 0.7f; // 0.3 stopped -> 1.0 at highway speed
+                float speedPct = Math.Min(1f, speedKmh / 180f); // 0 stopped -> 1.0 near top speed
 
-                float rpm = veh.CurrentRPM; // 0-1 in SHVDN
+                float rpm = veh.CurrentRPM; // 0-1
                 float throttle = Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate);
-                float loadFactor = 0.2f + rpm * 0.5f + throttle * 0.3f; // 0.2 idle -> ~1.0 at full rev/throttle
+                float loadPct = Math.Min(1f, rpm * 0.5f + throttle * 0.5f);
 
-                float modifier = speedFactor * loadFactor;
-                if (veh.ClassType == VehicleClass.Sports || veh.ClassType == VehicleClass.Super) modifier *= 1.2f;
+                // Slope: positive when climbing (nose pitched up), read from
+                // the vehicle's up vector Z tilt relative to its forward pitch.
+                float pitchDeg = Function.Call<float>(Hash.GET_ENTITY_PITCH, veh);
+                float slopePct = Math.Max(0f, Math.Min(1f, pitchDeg / 20f)); // 0 flat -> 1.0 at ~20deg+ climb
+
+                // Off-road: no road node nearby = dirt/rock/uneven ground.
+                bool onRoad = Function.Call<bool>(Hash.IS_POINT_ON_ROAD, veh.Position.X, veh.Position.Y, veh.Position.Z, veh);
+                float terrainPct = onRoad ? 0f : 1f;
+
+                // Weighted blend tuned so: clean road, full speed+load, flat
+                // -> ~50%. Off-road at similar pace -> ~70%. Full speed+load
+                // AND climbing AND off-road together -> ~100% (worst case).
+                float combined = speedPct * 0.30f + loadPct * 0.20f + terrainPct * 0.30f + slopePct * 0.20f;
+                combined = Math.Max(0.05f, Math.Min(1f, combined)); // idle floor so it's never literally zero
+
+                float modifier = combined * 2.0f; // scale so combined=0.5 (clean road/full) lands near the mid-range burn rate
+                if (veh.ClassType == VehicleClass.Sports || veh.ClassType == VehicleClass.Super) modifier *= 1.15f;
                 if (veh.EngineHealth < 700f) modifier *= 1.3f;
-                modifier = Math.Min(modifier, 1.5f) * _fuelConsumeRate;
 
+                // Startup burst: fresh ignition burns rich for ~2.5s (cold
+                // start enrichment), then settles down to the normal curve -
+                // matches "start pe usage zyada, phir kam hoke normal se
+                // shuru hota hai" instead of a flat instant rate.
+                double sinceStart = (DateTime.Now - _engineStartTime).TotalSeconds;
+                if (sinceStart < 2.5) modifier *= (float)(1.8 - (sinceStart / 2.5) * 0.8);
+
+                modifier = Math.Min(modifier, 2.2f) * _fuelConsumeRate;
                 if (DateTime.Now < _slowConsumptionUntil) modifier *= 0.5f;
 
                 float litresPerSecond = (6.5f / 100f) * modifier;
@@ -605,6 +628,7 @@ namespace SaifFuelMod
             }
             else
             {
+                _wasEngineRunning = false;
                 _currentUsageLps = 0f;
             }
         }
@@ -1065,10 +1089,18 @@ namespace SaifFuelMod
 
         // Draws a dotted "hose/pipe" line on screen between two world points -
         // used to show fuel visibly flowing from the heli down to the player.
+        // BUG FIX: this used to require BOTH endpoints to be on-screen, so
+        // the hose disappeared whenever the heli (hovering well above, often
+        // out of the driving camera's view) wasn't in frame. Now if only the
+        // heli end is off-screen, the hose anchors from the top edge instead
+        // of vanishing entirely.
         private void DrawFuelHose(Vector3 fromWorld, Vector3 toWorld, Color color)
         {
-            if (!WorldToScreen(fromWorld, out float x1, out float y1)) return;
-            if (!WorldToScreen(toWorld, out float x2, out float y2)) return;
+            bool toOk = WorldToScreen(toWorld, out float x2, out float y2);
+            if (!toOk) return; // nothing to anchor to if the attach point itself isn't visible
+
+            bool fromOk = WorldToScreen(fromWorld, out float x1, out float y1);
+            if (!fromOk) { x1 = x2; y1 = 0f; } // heli off top of frame - hose comes down from the top edge
 
             const int SEGMENTS = 16;
             for (int i = 0; i <= SEGMENTS; i++)
@@ -1151,7 +1183,7 @@ namespace SaifFuelMod
             // Reference ceiling = the highest possible burn rate at the
             // current consume-rate setting, so it reads empty when stopped
             // and fills toward full under max engine load/speed.
-            float maxLps = (6.5f / 100f) * 1.5f * Math.Max(0.1f, _fuelConsumeRate);
+            float maxLps = (6.5f / 100f) * 2.2f * Math.Max(0.1f, _fuelConsumeRate);
             float usagePct = maxLps > 0f ? Math.Min(1f, _currentUsageLps / maxLps) : 0f;
             _displayedUsagePct += (usagePct - _displayedUsagePct) * Math.Min(1f, Game.LastFrameTime * 4f);
 
@@ -1202,23 +1234,25 @@ namespace SaifFuelMod
         }
 
         // =================================================================
-        // AIRCRAFT THREAT RADAR - enemy fighter jet detector + guided
+        // AIRCRAFT THREAT RADAR - enemy fighter jet/heli detector + guided
         // missile lock warning, active only while flying a plane/helicopter.
         // Uses REAL native GTA Blips attached to each hostile aircraft, so
         // they render through the game's own minimap/main map system - no
         // custom-drawn overlay, box, or separate radar panel at all.
-        // Heuristic-based: GTA doesn't expose a direct "incoming missile"
-        // native, so a hostile aircraft is flagged as a lock threat once it
-        // is close AND pointed roughly at the player (within the missile's
-        // realistic engagement cone) - the same signal real lock-warning
-        // systems key off in-game. Scan radius/cone widened for max catch
-        // rate at the cost of a slightly wider "locking" definition.
+        //
+        // Missile-lock detection now reads the aircraft's own native homing
+        // weapon state (GET_VEHICLE_HOMING_LOCKON_STATE) - if IT has an
+        // active lock, that's a real lock, not just a distance/angle guess.
+        // The angle/range check is kept as a fallback for aircraft without
+        // homing weapons (cannon-only fighters) so they still register as a
+        // threat when lined up on you.
         // =================================================================
-        private const float THREAT_SCAN_RADIUS = 1400f;
-        private const float MISSILE_LOCK_RANGE = 500f;
-        private const float MISSILE_LOCK_CONE_DOT = 0.82f; // ~35 degrees, wider catch cone
+        private const float THREAT_SCAN_RADIUS = 2200f;
+        private const float MISSILE_LOCK_RANGE = 600f;
+        private const float MISSILE_LOCK_CONE_DOT = 0.80f; // ~37 degrees, wide catch cone
         private DateTime _lastThreatBeep = DateTime.MinValue;
         private readonly Dictionary<int, Blip> _threatBlips = new Dictionary<int, Blip>();
+        private readonly Dictionary<int, DateTime> _flareDetrackedUntil = new Dictionary<int, DateTime>();
 
         private void UpdateAircraftThreatRadar()
         {
@@ -1228,6 +1262,7 @@ namespace SaifFuelMod
             Vehicle myVeh = active ? playerPed.CurrentVehicle : null;
 
             UpdatePlayerMissiles(playerPed, active, myVeh);
+            UpdateFlares(playerPed, active, myVeh);
 
             if (!active)
             {
@@ -1237,6 +1272,7 @@ namespace SaifFuelMod
 
             var seenHandles = new HashSet<int>();
             bool anyLock = false;
+            bool anyAiming = false;
 
             foreach (Vehicle v in World.GetNearbyVehicles(myVeh.Position, THREAT_SCAN_RADIUS))
             {
@@ -1245,21 +1281,45 @@ namespace SaifFuelMod
                 Ped driver = v.Driver;
                 if (driver == null || !driver.Exists() || driver.IsDead) continue;
 
-                // hostile = actively in combat and targeting us, OR a known
-                // military response model (always hostile once spawned by
-                // wanted level) even before its combat flag ticks on -
-                // catches the aircraft a frame or two earlier for accuracy.
+                // hostile = actively in combat, OR the game's own
+                // relationship system already flags this ped as hating the
+                // player, OR a known military response model at wanted 3+ -
+                // much broader net than combat-flag alone, since that flag
+                // can lag a frame or two behind an aircraft that's already
+                // attacking.
                 bool inCombat = Function.Call<bool>(Hash.IS_PED_IN_COMBAT, driver, playerPed);
+                int relationship = Function.Call<int>(Hash.GET_RELATIONSHIP_BETWEEN_PEDS, driver, playerPed);
+                bool relHostile = relationship >= 5; // 5=hate, 4=dislike+ also counts as unfriendly
                 VehicleHash vh = (VehicleHash)v.Model.Hash;
-                bool isMilitaryModel = vh == VehicleHash.Hunter || vh == VehicleHash.Lazer || vh == VehicleHash.Besra;
-                bool hostile = inCombat || (isMilitaryModel && Function.Call<int>(Hash.GET_PLAYER_WANTED_LEVEL, Game.Player) >= 4);
+                bool isMilitaryModel = vh == VehicleHash.Hunter || vh == VehicleHash.Lazer || vh == VehicleHash.Besra || vh == VehicleHash.Savage;
+                bool hostile = inCombat || relHostile || (isMilitaryModel && Function.Call<int>(Hash.GET_PLAYER_WANTED_LEVEL, Game.Player) >= 3);
                 if (!hostile) continue;
+
+                // real native homing-lock state on the ENEMY aircraft itself -
+                // this is the ONLY thing that turns the blip orange, since
+                // it's a real lock. Non-homing/cannon aircraft can't produce
+                // this state, so they correctly never show as "locked".
+                int lockState = Function.Call<int>(Hash.GET_VEHICLE_HOMING_LOCKON_STATE, v);
+                bool nativeLocked = lockState >= 2;
 
                 float dist = v.Position.DistanceTo(myVeh.Position);
                 Vector3 toMe = (myVeh.Position - v.Position).Normalized;
                 float aim = Vector3.Dot(v.ForwardVector, toMe);
-                bool locking = dist <= MISSILE_LOCK_RANGE && aim >= MISSILE_LOCK_CONE_DOT;
+                // fallback for cannon-only aircraft: lined up and close =
+                // genuine danger, but NOT a missile lock, so it stays red
+                // and triggers a separate "INCOMING FIRE" warning instead of
+                // the orange missile-lock indicator.
+                bool aimingAtMe = dist <= MISSILE_LOCK_RANGE && aim >= MISSILE_LOCK_CONE_DOT;
+
+                bool locking = nativeLocked;
+
+                // flares suppress a real lock for a few seconds even if it
+                // re-acquires immediately
+                if (_flareDetrackedUntil.TryGetValue(v.Handle, out DateTime until) && DateTime.Now < until)
+                    locking = false;
+
                 if (locking) anyLock = true;
+                if (aimingAtMe && !locking) anyAiming = true;
 
                 seenHandles.Add(v.Handle);
                 SyncThreatBlip(v, locking);
@@ -1282,19 +1342,25 @@ namespace SaifFuelMod
                     Function.Call(Hash.PLAY_SOUND_FRONTEND, -1, "5_SEC_WARNING", "MP_LEADERBOARD_SOUNDSET", false);
                 }
             }
+            else if (anyAiming)
+            {
+                new TextElement("INCOMING FIRE", new PointF(Screen.Width / 2f - 100, 40), 0.45f, Color.Red, Font.ChaletComprimeCologne, GTA.UI.Alignment.Left, true, true).Draw();
+            }
         }
 
         // Creates/updates a real native Blip pinned to the hostile aircraft
         // itself - GTA moves it on the minimap/main map automatically every
         // frame as the aircraft flies, same as any other in-game blip.
+        // Icon matches the aircraft type: jet gets the Jet blip, helicopter
+        // gets the Helicopter blip, instead of one generic enemy icon.
         private void SyncThreatBlip(Vehicle v, bool locking)
         {
             if (!_threatBlips.TryGetValue(v.Handle, out Blip b) || b == null || !b.Exists())
             {
                 b = v.AddBlip();
-                b.Sprite = BlipSprite.Enemy;
+                b.Sprite = v.ClassType == VehicleClass.Helicopters ? BlipSprite.Helicopter : BlipSprite.Jet;
                 b.Scale = 0.9f;
-                b.Name = "Hostile Aircraft";
+                b.Name = v.ClassType == VehicleClass.Helicopters ? "Hostile Helicopter" : "Hostile Jet";
                 _threatBlips[v.Handle] = b;
             }
             b.Color = locking ? BlipColor.Orange : BlipColor.Red;
@@ -1401,6 +1467,88 @@ namespace SaifFuelMod
             foreach (var m in _playerMissiles)
                 if (m.Blip != null && m.Blip.Exists()) m.Blip.Delete();
             _playerMissiles.Clear();
+        }
+
+        // =================================================================
+        // FLARES - countermeasure against enemy missile locks. Press Space
+        // flying to pop a flare: shows as a real yellow blip drifting behind
+        // the aircraft (native blip on the main map, no overlay), and rolls
+        // a chance to break any currently-locking hostile's lock for a few
+        // seconds (native lock state re-syncs on its own after; the
+        // suppression window just stops it re-registering as a threat here).
+        // =================================================================
+        private class Flare { public Vector3 Position; public Vector3 Direction; public float LifeLeft; public Blip Blip; }
+        private readonly List<Flare> _flares = new List<Flare>();
+        private bool _wasFlareKeyDownLastTick = false;
+        private const float FLARE_LIFETIME = 4f;
+        private const float FLARE_DRIFT_SPEED = 25f;
+        private const float FLARE_BREAK_CHANCE = 0.65f;
+        private const float FLARE_SUPPRESS_SECONDS = 4f;
+
+        private void FireFlare(Vehicle myVeh)
+        {
+            var f = new Flare
+            {
+                Position = myVeh.Position - myVeh.ForwardVector * 4f,
+                Direction = -myVeh.ForwardVector,
+                LifeLeft = FLARE_LIFETIME
+            };
+            f.Blip = World.CreateBlip(f.Position);
+            f.Blip.Sprite = BlipSprite.Standard;
+            f.Blip.Color = BlipColor.Yellow;
+            f.Blip.Scale = 0.6f;
+            f.Blip.Name = "Flare";
+            f.Blip.IsFlashing = true;
+            _flares.Add(f);
+
+            Function.Call(Hash.PLAY_SOUND_FRONTEND, -1, "COUNTDOWN", "HUD_MINI_GAME_SOUNDSET", false);
+
+            // roll against every currently-locking threat
+            foreach (var handle in _threatBlips.Keys)
+            {
+                var ent = Entity.FromHandle(handle);
+                if (ent == null || !ent.Exists()) continue;
+                bool wasLocking = _threatBlips[handle] != null && _threatBlips[handle].Color == BlipColor.Orange;
+                if (!wasLocking) continue;
+                if (Rand.NextDouble() < FLARE_BREAK_CHANCE)
+                    _flareDetrackedUntil[handle] = DateTime.Now.AddSeconds(FLARE_SUPPRESS_SECONDS);
+            }
+        }
+
+        private void UpdateFlares(Ped playerPed, bool active, Vehicle myVeh)
+        {
+            if (active)
+            {
+                bool keyDown = Game.IsKeyPressed(Keys.Space);
+                if (keyDown && !_wasFlareKeyDownLastTick) FireFlare(myVeh);
+                _wasFlareKeyDownLastTick = keyDown;
+            }
+            else
+            {
+                _wasFlareKeyDownLastTick = false;
+            }
+
+            for (int i = _flares.Count - 1; i >= 0; i--)
+            {
+                var f = _flares[i];
+                f.Position += f.Direction * FLARE_DRIFT_SPEED * Game.LastFrameTime;
+                f.Position -= new Vector3(0, 0, 3f * Game.LastFrameTime); // gentle sink like a real flare
+                f.LifeLeft -= Game.LastFrameTime;
+                if (f.Blip != null && f.Blip.Exists()) f.Blip.Position = f.Position;
+
+                if (f.LifeLeft <= 0f)
+                {
+                    if (f.Blip != null && f.Blip.Exists()) f.Blip.Delete();
+                    _flares.RemoveAt(i);
+                }
+            }
+        }
+
+        private void ClearFlares()
+        {
+            foreach (var f in _flares)
+                if (f.Blip != null && f.Blip.Exists()) f.Blip.Delete();
+            _flares.Clear();
         }
 
         // =================================================================
