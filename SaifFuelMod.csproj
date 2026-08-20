@@ -43,10 +43,29 @@
   <ItemGroup>
     <PackageReference Include="ScriptHookVDotNet3" Version="3.6.0" />
     <PackageReference Include="LemonUI.SHVDN3" Version="2.2.0" />
+    <PackageReference Include="ILRepack.Lib.MSBuild.Task" Version="2.0.34" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="AssemblyInfo.cs" />
     <Compile Include="SaifFuelMod.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+
+  <!-- Merges LemonUI.dll into SaifFuelMod.dll after build so the scripts
+       folder only needs ONE mod file instead of two. ScriptHookVDotNet3.dll
+       is left alone since it's the host loader's own shared dependency. -->
+  <Target Name="ILRepackLemonUI" AfterTargets="Build">
+    <ItemGroup>
+      <MergeAssembly Include="$(OutputPath)LemonUI.SHVDN3.dll" Condition="Exists('$(OutputPath)LemonUI.SHVDN3.dll')" />
+      <MergeAssembly Include="$(OutputPath)LemonUI.dll" Condition="Exists('$(OutputPath)LemonUI.dll')" />
+    </ItemGroup>
+    <ILRepack
+      Parallel="true"
+      DebugInfo="true"
+      Internalize="true"
+      InputAssemblies="$(OutputPath)$(AssemblyName).dll;@(MergeAssembly)"
+      OutputFile="$(OutputPath)$(AssemblyName).dll"
+      LibraryPath="$(OutputPath)"
+      Condition="'@(MergeAssembly)' != ''" />
+  </Target>
 </Project>
