@@ -38,17 +38,29 @@ namespace SaifFuelMod
         // =================================================================
         // STATION DATA - real per-machine coordinates
         // =================================================================
+        private class Machine
+        {
+            public Vector3 Position;
+            // 0.80-1.20 - drives the vehicle top-speed modifier after
+            // refueling from THIS specific pump (see ApplyFuelQualityToVehicle).
+            // Every machine at a station rolls its own quality, so even
+            // pumps standing right next to each other at the same station
+            // can differ - matches how a real station can have one pump
+            // running cleaner fuel than its neighbor.
+            public float Quality = 1f;
+        }
+
         private class Station
         {
             public string Name;
-            public Dictionary<string, Vector3> Machines = new Dictionary<string, Vector3>();
+            public Dictionary<string, Machine> Machines = new Dictionary<string, Machine>();
             public bool IsMountain;
             public float RegionPriceMult = 1f;
             public bool OutOfStock;
             public DateTime OutOfStockUntil = DateTime.MinValue;
-            // 0.85-1.15 - drives blip color AND the vehicle top-speed
-            // modifier applied after refueling here (see ApplyFuelQualityToVehicle).
-            public float FuelQuality = 1f;
+            // Average of all machines - only used for the map blip color,
+            // giving a rough "overall" read of this station before arriving.
+            public float FuelQuality => Machines.Count > 0 ? Machines.Values.Average(m => m.Quality) : 1f;
         }
 
         private readonly List<Station> _stations = new List<Station>();
@@ -58,16 +70,22 @@ namespace SaifFuelMod
             void Add(string name, params (string type, float x, float y, float z)[] machines)
             {
                 var s = new Station { Name = name };
-                foreach (var m in machines) s.Machines[m.type] = new Vector3(m.x, m.y, m.z);
+                foreach (var m in machines)
+                {
+                    s.Machines[m.type] = new Machine
+                    {
+                        Position = new Vector3(m.x, m.y, m.z),
+                        Quality = 0.80f + (float)Rand.NextDouble() * 0.40f
+                    };
+                }
 
                 float avgZ = 0f;
-                foreach (var mv in s.Machines.Values) avgZ += mv.Z;
+                foreach (var mv in s.Machines.Values) avgZ += mv.Position.Z;
                 avgZ /= Math.Max(1, s.Machines.Count);
                 s.IsMountain = avgZ > 90f;
                 s.RegionPriceMult = s.IsMountain
                     ? 1.10f + (float)Rand.NextDouble() * 0.20f
                     : 0.95f + (float)Rand.NextDouble() * 0.15f;
-                s.FuelQuality = 0.85f + (float)Rand.NextDouble() * 0.30f;
 
                 _stations.Add(s);
             }
@@ -174,6 +192,7 @@ namespace SaifFuelMod
         // Pump proximity
         private Station _nearStation = null;
         private string _nearFuelType = null;
+        private float _nearMachineQuality = 1f;
 
         private enum ActiveJob { None, Refuel, Repair }
         private ActiveJob _activeJob = ActiveJob.None;
@@ -181,7 +200,7 @@ namespace SaifFuelMod
         private float _jobStartValue = 0f;
 
         // Fuel delivery by helicopter
-        private enum DeliveryPhase { None, Inbound, Hovering, Leaving }
+        private enum DeliveryPhase { None, Inbound, Descending, Hovering, Leaving }
         private DeliveryPhase _deliveryPhase = DeliveryPhase.None;
         private Vehicle _deliveryPlane = null;
         private Ped _deliveryPilot = null;
@@ -512,7 +531,7 @@ namespace SaifFuelMod
         private const string SHARED_BLIP_NAME = "Saif Fuel Station";
         private void CreateStationBlips(Station st)
         {
-            Vector3 anchor = st.Machines.Values.First();
+            Vector3 anchor = st.Machines.Values.First().Position;
             Blip b = World.CreateBlip(anchor);
             b.Sprite = BlipSprite.JerryCan;
             b.Color = st.FuelQuality >= 1.05f ? BlipColor.Green
@@ -599,45 +618,67 @@ namespace SaifFuelMod
                 if (!_wasEngineRunning) _engineStartTime = DateTime.Now;
                 _wasEngineRunning = true;
 
-                float speedKmh = veh.Speed * 3.6f;
-                float movementFactor = Math.Min(1f, speedKmh / 180f); // 0 stopped -> 1.0 near top speed
-
                 float rpm = veh.CurrentRPM; // 0-1
                 float throttle = Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate);
-                float loadFactor = Math.Max(0.2f, Math.Min(1f, rpm * 0.5f + throttle * 0.5f));
+                float brake = Game.GetControlValueNormalized(GTA.Control.VehicleBrake);
+                float loadFactor = Math.Max(0.15f, Math.Min(1f, rpm * 0.5f + throttle * 0.5f));
 
-                // Slope: only matters while the vehicle is actually climbing
-                // under its own power, not just sitting on an incline.
+                // Coasting/braking: foot off the gas (and/or braking) means
+                // the engine isn't doing work even if RPM is still showing
+                // from momentum - burn drops toward idle instead of tracking
+                // leftover RPM, matching real fuel-cut-on-overrun behavior.
+                bool coasting = throttle < 0.05f;
+                if (coasting) loadFactor = brake > 0.1f ? 0.10f : Math.Min(loadFactor, 0.25f);
+
+                float speedKmh = veh.Speed * 3.6f;
+                float speedNorm = Math.Min(1f, speedKmh / 180f);
+
+                // Slope + off-road now multiply the LOAD component, not raw
+                // speed - matches real life: climbing a mountain SLOWLY
+                // under heavy throttle still burns a lot because the engine
+                // is working hard against gravity/terrain, regardless of
+                // how fast you're actually moving. A flat, light-throttle
+                // cruise barely uses anything even at speed.
                 float pitchDeg = Function.Call<float>(Hash.GET_ENTITY_PITCH, veh);
                 float slopePct = Math.Max(0f, Math.Min(1f, pitchDeg / 20f)); // 0 flat -> 1.0 at ~20deg+ climb
-                float slopeMult = 1f + slopePct * 0.45f; // up to +45% while climbing hard
+                float slopeMult = 1f + slopePct * 1.1f; // climbing hard can more than double the load burn
 
-                // BUG FIX: off-road used to add a flat penalty regardless of
-                // speed, so a parked off-road vehicle burned the same as one
-                // driving fast off-road. Terrain now only multiplies the
-                // MOVEMENT-based burn, so stopped = idle rate everywhere,
-                // and off-road only costs extra once you're actually moving.
                 bool onRoad = Function.Call<bool>(Hash.IS_POINT_ON_ROAD, veh.Position.X, veh.Position.Y, veh.Position.Z, veh);
-                float terrainMult = onRoad ? 1f : 1.45f;
+                float terrainMult = onRoad ? 1f : 1.4f;
 
-                // idleBase = small constant burn just from the engine
-                // running, present even parked. Everything else only kicks
-                // in once you're moving: clean road/full speed+load -> ~50%
-                // of the gauge ceiling, off-road -> ~70%, off-road+uphill
-                // full load -> ~100% (worst case).
-                const float idleBase = 0.1f;
-                float modifier = idleBase + movementFactor * loadFactor * terrainMult * slopeMult;
+                // Heavier vehicle classes genuinely burn more per unit of
+                // load in real life - a loaded truck/SUV works its engine
+                // harder than a hatchback at the same throttle position.
+                float weightMult = 1f;
+                switch (veh.ClassType)
+                {
+                    case VehicleClass.Industrial:
+                    case VehicleClass.Commercial:
+                    case VehicleClass.Utility: weightMult = 1.35f; break;
+                    case VehicleClass.SUVs:
+                    case VehicleClass.Vans: weightMult = 1.15f; break;
+                    case VehicleClass.Motorcycles: weightMult = 0.7f; break;
+                }
+
+                const float idleBase = 0.08f; // small constant burn just from the engine running, even parked
+                float loadBurn = loadFactor * terrainMult * slopeMult * weightMult; // primary driver - how hard the engine works
+                float aeroBurn = speedNorm * speedNorm * 0.35f; // secondary - only matters at real speed (drag), negligible slow
+
+                float modifier = idleBase + loadBurn + aeroBurn;
 
                 if (veh.ClassType == VehicleClass.Sports || veh.ClassType == VehicleClass.Super) modifier *= 1.1f;
                 if (veh.EngineHealth < 700f) modifier *= 1.2f;
 
                 // Startup burst: a short rich-burn spike right after ignition
-                // (~1.5s), then settles down into the normal speed/load-based
-                // curve above instead of jumping straight to steady-state.
+                // (~1.5s), then settles into the load-based curve above -
+                // and every time the throttle is tapped after idling
+                // (stop-start driving), loadFactor itself spikes naturally,
+                // giving the same "burst then settle" feel without a
+                // separate special case.
                 double sinceStart = (DateTime.Now - _engineStartTime).TotalSeconds;
                 if (sinceStart < 1.5) modifier *= (float)(2.0 - (sinceStart / 1.5) * 1.0);
 
-                modifier = Math.Min(modifier, 2.2f) * _fuelConsumeRate;
+                modifier = Math.Min(modifier, 2.6f) * _fuelConsumeRate;
                 if (DateTime.Now < _slowConsumptionUntil) modifier *= 0.5f;
 
                 float litresPerSecond = (6.5f / 100f) * modifier;
@@ -746,13 +787,13 @@ namespace SaifFuelMod
             return "Regular";
         }
 
-        private (Station, string, Vector3) FindNearbyMachine(Vector3 pos, float range)
+        private (Station, string, Vector3, float) FindNearbyMachine(Vector3 pos, float range)
         {
             foreach (var st in _stations)
                 foreach (var kvp in st.Machines)
-                    if (kvp.Value.DistanceTo(pos) <= range)
-                        return (st, kvp.Key, kvp.Value);
-            return (null, null, Vector3.Zero);
+                    if (kvp.Value.Position.DistanceTo(pos) <= range)
+                        return (st, kvp.Key, kvp.Value.Position, kvp.Value.Quality);
+            return (null, null, Vector3.Zero, 1f);
         }
 
         private void UpdatePumpProximity()
@@ -765,9 +806,10 @@ namespace SaifFuelMod
             Vehicle veh = playerPed.CurrentVehicle;
             if (veh == null || veh.Driver != playerPed || veh.Speed > 1.0f) { _serviceMenu.Visible = false; _nearStation = null; return; }
 
-            var (station, type, pos) = FindNearbyMachine(veh.Position, 6f);
+            var (station, type, pos, quality) = FindNearbyMachine(veh.Position, 6f);
             _nearStation = station;
             _nearFuelType = type;
+            _nearMachineQuality = quality;
             if (station == null) { _serviceMenu.Visible = false; return; }
 
             if (station.OutOfStock)
@@ -809,7 +851,7 @@ namespace SaifFuelMod
             _fuelAmountItem.Description = $"{type} @ ${price:F2}/L - Total: ${_fuelAmountItem.SelectedItem * price:F2}";
             _customAmountItem.Description = "Type an exact litre amount to fill";
             _repairItem.Description = $"${GetRepairCost(veh):F2}";
-            _buyNowUseLaterItem.Description = $"{station.FuelQuality * 100f:F0}% quality - pay now, saved for later at this pump's price";
+            _buyNowUseLaterItem.Description = $"{_nearMachineQuality * 100f:F0}% quality - pay now, saved for later at this pump's price";
             _serviceMenu.Name = $"{station.Name} ({type})";
 
             if (!_serviceMenu.Visible) _serviceMenu.Visible = true;
@@ -820,7 +862,7 @@ namespace SaifFuelMod
             if (litres <= 0.5f) { ShowToast("~y~Tank is already full."); return; }
             float cost = litres * GetFuelPrice(_nearFuelType, _nearStation);
             StartJob(ActiveJob.Refuel, cost, "Refueling", litres);
-            if (_nearStation != null) ApplyFuelQualityToVehicle(_nearStation.FuelQuality);
+            if (_nearStation != null) ApplyFuelQualityToVehicle(_nearMachineQuality);
         }
 
         private void ConfirmCustomRefuel()
@@ -983,16 +1025,79 @@ namespace SaifFuelMod
         // plugs in near an actual wheel instead of the vehicle's center.
         private Vector3 GetRearTireAttachPoint(Vehicle veh)
         {
+            return veh.GetOffsetPosition(GetRearTireLocalOffset(veh));
+        }
+
+        // Same tire spot, but as a LOCAL (vehicle-relative) offset - this is
+        // what ATTACH_ENTITIES_TO_ROPE actually wants for the target entity.
+        private Vector3 GetRearTireLocalOffset(Vehicle veh)
+        {
             var minOut = new OutputArgument();
             var maxOut = new OutputArgument();
             Function.Call(Hash.GET_MODEL_DIMENSIONS, veh.Model.Hash, minOut, maxOut);
             Vector3 min = minOut.GetResult<Vector3>();
             Vector3 max = maxOut.GetResult<Vector3>();
             float sideOffset = _hoseAttachRight ? max.X * 0.9f : min.X * 0.9f;
-            Vector3 local = new Vector3(sideOffset, min.Y * 0.85f, min.Z + 0.15f);
-            return veh.GetOffsetPosition(local);
+            return new Vector3(sideOffset, min.Y * 0.85f, min.Z + 0.15f);
+        }
+
+        // =================================================================
+        // REAL NATIVE ROPE - the hose is a genuine GTA rope object attached
+        // to the helicopter and the vehicle's rear tire, simulated and
+        // rendered by the game itself every frame. It naturally stays
+        // connected and sways as either entity moves, instead of a redrawn
+        // 2D line that lags behind.
+        // =================================================================
+        private int _hoseRopeHandle = -1;
+        private bool _ropeTexturesRequested = false;
+
+        private void EnsureHoseRope(Vehicle heli, Vehicle targetVeh)
+        {
+            if (!_ropeTexturesRequested)
+            {
+                Function.Call(Hash.ROPE_LOAD_TEXTURES);
+                _ropeTexturesRequested = true;
+            }
+            if (_hoseRopeHandle != -1) return; // already attached for this hover
+            if (!Function.Call<bool>(Hash.ROPE_ARE_TEXTURES_LOADED)) return; // wait a frame or two for load
+
+            Vector3 start = heli.Position;
+            _hoseRopeHandle = Function.Call<int>(Hash.ADD_ROPE,
+                start.X, start.Y, start.Z, 0f, 0f, 0f,
+                6.0f,   // initial length
+                3,      // rope type (thin cable)
+                15.0f,  // max length
+                0.2f,   // min length
+                1.0f,   // length change rate
+                false, false, false, true, 1.0f);
+
+            Vector3 tireLocal = GetRearTireLocalOffset(targetVeh);
+            Function.Call(Hash.ATTACH_ENTITIES_TO_ROPE, _hoseRopeHandle, heli, targetVeh,
+                0f, 0f, -2f,
+                tireLocal.X, tireLocal.Y, tireLocal.Z,
+                12.0f, false, false, "", "");
+        }
+
+        private void DeleteHoseRope()
+        {
+            if (_hoseRopeHandle == -1) return;
+            var ropeArg = new OutputArgument(_hoseRopeHandle);
+            Function.Call(Hash.DELETE_ROPE, ropeArg);
+            _hoseRopeHandle = -1;
         }
         private float _hoseExtendT = 0f;
+        // City buildings top out well under 200m (Maze Bank Tower is the
+        // tallest at ~200m), while GTA's mountains (Chiliad, Tongva, the
+        // Vinewood hills) sit at real elevated Z values themselves. Basing
+        // the choice on the player's own world-Z is a simple, reliable way
+        // to tell "up a mountain" from "downtown" without terrain sampling.
+        private const float CITY_CRUISE_ALTITUDE = 140f;
+        private const float MOUNTAIN_CRUISE_ALTITUDE = 260f;
+        private const float MOUNTAIN_ELEVATION_THRESHOLD = 70f;
+        private float GetCruiseAltitude(Vector3 nearPos)
+        {
+            return nearPos.Z > MOUNTAIN_ELEVATION_THRESHOLD ? MOUNTAIN_CRUISE_ALTITUDE : CITY_CRUISE_ALTITUDE;
+        }
 
         private void TryCallDelivery()
         {
@@ -1002,7 +1107,7 @@ namespace SaifFuelMod
             Ped playerPed = Game.Player.Character;
 
             _deliveryTargetPos = playerPed.Position + new Vector3(0, 0, 22f); // hover height above player
-            _deliveryStartPos = _deliveryTargetPos + (playerPed.ForwardVector * -500f) + new Vector3(0, 0, 60f);
+            _deliveryStartPos = playerPed.Position + new Vector3(0, 0, GetCruiseAltitude(playerPed.Position)) + (playerPed.ForwardVector * -500f);
 
             _deliveryPlane = World.CreateVehicle(VehicleHash.Maverick, _deliveryStartPos, 0f);
             if (_deliveryPlane == null) { ShowToast("~r~Delivery failed to launch."); return; }
@@ -1046,15 +1151,43 @@ namespace SaifFuelMod
             {
                 case DeliveryPhase.Inbound:
                     {
+                        // BUG FIX: this used to lerp straight from the spawn
+                        // point to the low ~22m hover height the whole way,
+                        // so on a straight-line path across mountainous
+                        // terrain the heli could clip INTO a ridge/peak
+                        // partway there and be invisible even though it was
+                        // technically still "flying". Now it cruises at a
+                        // safe high altitude (well above typical terrain)
+                        // during the approach, and only descends to hover
+                        // height once directly above the player.
+                        Vector3 cruiseTarget = playerPed.Position + new Vector3(0, 0, GetCruiseAltitude(playerPed.Position));
                         _deliveryTargetPos = playerPed.Position + new Vector3(0, 0, 22f);
 
                         _deliveryFlightT += Game.LastFrameTime / DELIVERY_FLIGHT_SECONDS;
                         float t = Math.Min(1f, _deliveryFlightT);
-                        Vector3 pos = Vector3.Lerp(_deliveryStartPos, _deliveryTargetPos, t);
+                        Vector3 pos = Vector3.Lerp(_deliveryStartPos, cruiseTarget, t);
                         MovePlaneTo(pos);
 
                         float dist = _deliveryPlane.Position.DistanceTo(playerPed.Position);
                         new TextElement($"Fuel delivery inbound: {dist:F0}m", new PointF(20, 60), 0.26f, Color.FromArgb(255, 255, 220, 120), Font.ChaletLondon).Draw();
+
+                        if (t >= 1f)
+                        {
+                            _deliveryPhase = DeliveryPhase.Descending;
+                            _deliveryFlightT = 0f;
+                        }
+                        break;
+                    }
+
+                case DeliveryPhase.Descending:
+                    {
+                        _deliveryFlightT += Game.LastFrameTime / 3.5f;
+                        float t = Math.Min(1f, _deliveryFlightT);
+                        Vector3 from = playerPed.Position + new Vector3(0, 0, GetCruiseAltitude(playerPed.Position));
+                        Vector3 to = playerPed.Position + new Vector3(0, 0, 22f);
+                        MovePlaneTo(Vector3.Lerp(from, to, t), faceDown: true);
+
+                        new TextElement("Fuel delivery descending...", new PointF(20, 60), 0.26f, Color.FromArgb(255, 255, 220, 120), Font.ChaletLondon).Draw();
 
                         if (t >= 1f)
                         {
@@ -1071,23 +1204,35 @@ namespace SaifFuelMod
                         Vector3 hoverPos = playerPed.Position + new Vector3(0, 0, 22f);
                         MovePlaneTo(hoverPos, faceDown: true);
 
-                        // hose visibly LOWERS from the heli down to the fuel
-                        // cap first, then refuel only starts once it's fully
-                        // extended/attached - not both happening instantly.
-                        // Attach point is a real rear-side tire position
-                        // (left or right, picked once per delivery) instead
-                        // of the vehicle's center, so it looks like it's
-                        // actually plugged into the fuel cap by the wheel.
-                        Vector3 attachPoint = playerPed.IsInVehicle()
-                            ? GetRearTireAttachPoint(playerPed.CurrentVehicle)
-                            : playerPed.Position;
-                        Vector3 hoseAnchor = hoverPos + new Vector3(0, 0, -3f);
-                        Vector3 hoseTargetEnd = attachPoint + new Vector3(0, 0, 0.3f);
+                        bool inVeh = playerPed.IsInVehicle();
+                        Vehicle targetVeh = inVeh ? playerPed.CurrentVehicle : null;
 
+                        if (inVeh)
+                        {
+                            // REAL native rope, physically attached to the
+                            // heli and the vehicle's rear tire - GTA
+                            // simulates and renders this every frame on its
+                            // own, so it genuinely stays connected as either
+                            // one moves, instead of a redrawn 2D line that
+                            // visibly lags a frame behind.
+                            EnsureHoseRope(_deliveryPlane, targetVeh);
+                        }
+                        else
+                        {
+                            // on-foot fallback: no vehicle to attach a real
+                            // rope to, use the old screen-space hose instead
+                            DeleteHoseRope();
+                            Vector3 hoseAnchor = hoverPos + new Vector3(0, 0, -3f);
+                            Vector3 hoseTargetEnd = playerPed.Position + new Vector3(0, 0, 0.3f);
+                            Vector3 hoseEnd = Vector3.Lerp(hoseAnchor, hoseTargetEnd, _hoseExtendT);
+                            DrawFuelHose(hoseAnchor, hoseEnd, Color.FromArgb(235, 220, 170, 40));
+                        }
+
+                        // hose "extending" still gates when the fill
+                        // actually starts, even though the rope itself is
+                        // already attached - gives a beat of lowering time
+                        // before fuel starts flowing.
                         _hoseExtendT = Math.Min(1f, _hoseExtendT + Game.LastFrameTime / HOSE_EXTEND_SECONDS);
-                        Vector3 hoseEnd = Vector3.Lerp(hoseAnchor, hoseTargetEnd, _hoseExtendT);
-                        DrawFuelHose(hoseAnchor, hoseEnd, Color.FromArgb(235, 220, 170, 40));
-
                         bool attached = _hoseExtendT >= 1f;
                         if (attached)
                         {
@@ -1108,6 +1253,7 @@ namespace SaifFuelMod
                         {
                             ShowToast("~g~Tank filled by air delivery!");
                             SaveAllData();
+                            DeleteHoseRope();
                             _deliveryPhase = DeliveryPhase.Leaving;
                             _deliveryFlightT = 0f;
                         }
@@ -1195,6 +1341,7 @@ namespace SaifFuelMod
 
         private void CleanupDelivery()
         {
+            DeleteHoseRope();
             if (_deliveryBlip != null && _deliveryBlip.Exists()) _deliveryBlip.Delete();
             if (_deliveryPilot != null && _deliveryPilot.Exists()) _deliveryPilot.Delete();
             if (_deliveryPlane != null && _deliveryPlane.Exists()) _deliveryPlane.Delete();
@@ -1242,7 +1389,7 @@ namespace SaifFuelMod
             // Reference ceiling = the highest possible burn rate at the
             // current consume-rate setting, so it reads empty when stopped
             // and fills toward full under max engine load/speed.
-            float maxLps = (6.5f / 100f) * 2.2f * Math.Max(0.1f, _fuelConsumeRate);
+            float maxLps = (6.5f / 100f) * 2.6f * Math.Max(0.1f, _fuelConsumeRate);
             float usagePct = maxLps > 0f ? Math.Min(1f, _currentUsageLps / maxLps) : 0f;
             _displayedUsagePct += (usagePct - _displayedUsagePct) * Math.Min(1f, Game.LastFrameTime * 4f);
 
@@ -1772,7 +1919,7 @@ namespace SaifFuelMod
             if (_ambientVehicles.Count >= AMBIENT_TARGET_COUNT || _stations.Count == 0) return;
 
             var station = _stations[Rand.Next(_stations.Count)];
-            var machine = station.Machines.Values.First();
+            var machine = station.Machines.Values.First().Position;
             Vector3 spawnPos = machine + new Vector3(3f, 0f, 0f);
             if (spawnPos.DistanceTo(Game.Player.Character.Position) < 40f) return;
 
