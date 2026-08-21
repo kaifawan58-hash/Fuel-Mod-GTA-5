@@ -1017,25 +1017,6 @@ namespace SaifFuelMod
 
         private const float HOVER_DURATION_SECONDS = 12f;
         private const float HOSE_EXTEND_SECONDS = 1.5f;
-        private bool _hoseAttachRight = true;
-
-        // Finds a real rear-side tire position on the vehicle (left or
-        // right, picked once per delivery) using the model's actual bounding
-        // dimensions, transformed into world space - so the hose always
-        // plugs in near an actual wheel instead of the vehicle's center.
-        // Recomputed fresh every frame from the vehicle's LIVE position, so
-        // the hose visually tracks it in real time with no physics risk.
-        private Vector3 GetRearTireAttachPoint(Vehicle veh)
-        {
-            var minOut = new OutputArgument();
-            var maxOut = new OutputArgument();
-            Function.Call(Hash.GET_MODEL_DIMENSIONS, veh.Model.Hash, minOut, maxOut);
-            Vector3 min = minOut.GetResult<Vector3>();
-            Vector3 max = maxOut.GetResult<Vector3>();
-            float sideOffset = _hoseAttachRight ? max.X * 0.9f : min.X * 0.9f;
-            Vector3 local = new Vector3(sideOffset, min.Y * 0.85f, min.Z + 0.15f);
-            return veh.GetOffsetPosition(local);
-        }
         private float _hoseExtendT = 0f;
         private int _hoverTargetVehicleHandle = -1;
         // City buildings top out well under 200m (Maze Bank Tower is the
@@ -1083,7 +1064,6 @@ namespace SaifFuelMod
 
             _money -= _deliveryCost;
             _deliveryPhase = DeliveryPhase.Inbound;
-            _hoseAttachRight = Rand.Next(2) == 0;
             _deliveryFlightT = 0f;
             _deliveryFillProgress = 0f;
             ShowToast($"~g~Fuel delivery dispatched~w~ (${_deliveryCost}). Watch the sky above you.");
@@ -1186,18 +1166,11 @@ namespace SaifFuelMod
                         Vector3 hoverPos = playerPed.Position + new Vector3(0, 0, 22f);
                         MovePlaneTo(hoverPos, faceDown: true);
 
-                        // Hose recomputed fresh from LIVE positions every
-                        // single frame - both ends always match exactly
-                        // where the heli and vehicle actually are right now,
-                        // so it visually tracks in real time with zero
-                        // physics risk (previous native-rope version could
-                        // yank the vehicle away if you swapped cars).
-                        Vector3 attachPoint = GetRearTireAttachPoint(playerPed.CurrentVehicle);
-                        Vector3 hoseAnchor = hoverPos + new Vector3(0, 0, -3f);
-                        Vector3 hoseTargetEnd = attachPoint + new Vector3(0, 0, 0.3f);
+                        // Hose visual removed - it never read as a real
+                        // physical connection no matter how it was drawn, so
+                        // this now just keeps the same "lowering, then
+                        // attached" timing gate without a drawn line.
                         _hoseExtendT = Math.Min(1f, _hoseExtendT + Game.LastFrameTime / HOSE_EXTEND_SECONDS);
-                        Vector3 hoseEnd = Vector3.Lerp(hoseAnchor, hoseTargetEnd, _hoseExtendT);
-                        DrawFuelHose(hoseAnchor, hoseEnd, Color.FromArgb(235, 220, 170, 40));
 
                         bool attached = _hoseExtendT >= 1f;
                         if (attached)
@@ -1236,51 +1209,6 @@ namespace SaifFuelMod
         }
 
         // Projects a world point to screen space (0-1 normalized -> pixels).
-        private bool WorldToScreen(Vector3 world, out float screenX, out float screenY)
-        {
-            var ox = new OutputArgument();
-            var oy = new OutputArgument();
-            bool onScreen = Function.Call<bool>(Hash.GET_SCREEN_COORD_FROM_WORLD_COORD, world.X, world.Y, world.Z, ox, oy);
-            screenX = onScreen ? ox.GetResult<float>() * Screen.Width : 0f;
-            screenY = onScreen ? oy.GetResult<float>() * Screen.Height : 0f;
-            return onScreen;
-        }
-
-        // Draws a dotted "hose/pipe" line on screen between two world points -
-        // used to show fuel visibly flowing from the heli down to the player.
-        // BUG FIX: this used to require BOTH endpoints to be on-screen, so
-        // the hose disappeared whenever the heli (hovering well above, often
-        // out of the driving camera's view) wasn't in frame. Now if only the
-        // heli end is off-screen, the hose anchors from the top edge instead
-        // of vanishing entirely.
-        private void DrawFuelHose(Vector3 fromWorld, Vector3 toWorld, Color color)
-        {
-            bool toOk = WorldToScreen(toWorld, out float x2, out float y2);
-            if (!toOk) return; // nothing to anchor to if the attach point itself isn't visible
-
-            bool fromOk = WorldToScreen(fromWorld, out float x1, out float y1);
-            if (!fromOk) { x1 = x2; y1 = 0f; } // heli off top of frame - hose comes down from the top edge
-
-            // Dense, overlapping segments (no gaps) with a slight sideways
-            // sag partway down reads as a solid hanging rope/pipe instead of
-            // a spaced-out dotted line.
-            const int SEGMENTS = 40;
-            float dx = x2 - x1, dy = y2 - y1;
-            float len = (float)Math.Sqrt(dx * dx + dy * dy);
-            float sagAmount = Math.Min(18f, len * 0.06f);
-            Color coreColor = Color.FromArgb(color.A, Math.Max(0, color.R - 60), Math.Max(0, color.G - 60), Math.Max(0, color.B - 60));
-
-            for (int i = 0; i <= SEGMENTS; i++)
-            {
-                float t = i / (float)SEGMENTS;
-                float sag = (float)Math.Sin(t * Math.PI) * sagAmount; // bows outward at the midpoint like real rope slack
-                float px = x1 + dx * t + sag;
-                float py = y1 + dy * t;
-                new ContainerElement(new PointF(px - 4, py - 4), new SizeF(8, 8), color).Draw();
-                new ContainerElement(new PointF(px - 2, py - 2), new SizeF(4, 4), coreColor).Draw();
-            }
-        }
-
         // Moves the delivery plane by hand instead of relying on an AI flight
         // task - guarantees it never clips a building or gets stuck on terrain,
         // since it's just following a straight scripted line through open air.
