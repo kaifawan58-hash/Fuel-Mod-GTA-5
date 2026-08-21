@@ -983,8 +983,11 @@ namespace SaifFuelMod
         // plugs in near an actual wheel instead of the vehicle's center.
         private Vector3 GetRearTireAttachPoint(Vehicle veh)
         {
-            Vector3 min, max;
-            veh.Model.GetDimensions(out min, out max);
+            var minOut = new OutputArgument();
+            var maxOut = new OutputArgument();
+            Function.Call(Hash.GET_MODEL_DIMENSIONS, veh.Model.Hash, minOut, maxOut);
+            Vector3 min = minOut.GetResult<Vector3>();
+            Vector3 max = maxOut.GetResult<Vector3>();
             float sideOffset = _hoseAttachRight ? max.X * 0.9f : min.X * 0.9f;
             Vector3 local = new Vector3(sideOffset, min.Y * 0.85f, min.Z + 0.15f);
             return veh.GetOffsetPosition(local);
