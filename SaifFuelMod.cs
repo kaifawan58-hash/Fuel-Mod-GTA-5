@@ -148,6 +148,7 @@ namespace SaifFuelMod
         private float _hudScale = 0.6f;
         private float _displayedFuelPct = 1f; // lerped toward the real value for a live-draining look
         private float _displayedUsagePct = 0f; // lerped current fuel-burn rate, for the usage line
+        private float _displayedThrustPct = 0f; // lerped jet thrust readout
 
         // =================================================================
         // VEHICLE STATE
@@ -186,7 +187,7 @@ namespace SaifFuelMod
         private Ped _deliveryPilot = null;
         private Blip _deliveryBlip = null;
         private float _deliveryFillProgress = 0f;
-        private const int DELIVERY_COST = 120;
+        private int _deliveryCost = 120;
 
         private readonly List<Vehicle> _ambientVehicles = new List<Vehicle>();
         private readonly List<Ped> _ambientPeds = new List<Ped>();
@@ -210,6 +211,7 @@ namespace SaifFuelMod
         private NativeListItem<float> _priceRegularItem;
         private NativeListItem<float> _priceDieselItem;
         private NativeListItem<float> _pricePremiumItem;
+        private NativeListItem<int> _deliveryCostItem;
         private NativeListItem<int> _hudOffsetXItem;
         private NativeListItem<int> _hudOffsetYItem;
         private NativeListItem<float> _hudScaleItem;
@@ -236,7 +238,7 @@ namespace SaifFuelMod
 
             Tick += OnTick;
             KeyDown += OnKeyDown;
-            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); ClearPlayerMissiles(); ClearFlares(); };
+            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); ClearPlayerMissiles(); ClearEnemyMissiles(); ClearFlares(); };
         }
 
         // =================================================================
@@ -319,6 +321,10 @@ namespace SaifFuelMod
             SelectClosest(_pricePremiumItem, _pricePremium);
             _pricePremiumItem.ItemChanged += (s, e) => _pricePremium = _pricePremiumItem.SelectedItem;
 
+            _deliveryCostItem = new NativeListItem<int>("Air Delivery Price", IntSteps(20, 500, 10));
+            SelectClosest(_deliveryCostItem, _deliveryCost);
+            _deliveryCostItem.ItemChanged += (s, e) => _deliveryCost = _deliveryCostItem.SelectedItem;
+
             _hudOffsetXItem = new NativeListItem<int>("HUD X Position", IntSteps(0, 1800, 10));
             SelectClosest(_hudOffsetXItem, (int)_hudOffsetX);
             _hudOffsetXItem.ItemChanged += (s, e) => _hudOffsetX = _hudOffsetXItem.SelectedItem;
@@ -339,6 +345,7 @@ namespace SaifFuelMod
             _settingsMenu.Add(_priceRegularItem);
             _settingsMenu.Add(_priceDieselItem);
             _settingsMenu.Add(_pricePremiumItem);
+            _settingsMenu.Add(_deliveryCostItem);
             _settingsMenu.Add(_hudOffsetXItem);
             _settingsMenu.Add(_hudOffsetYItem);
             _settingsMenu.Add(_hudScaleItem);
@@ -593,37 +600,42 @@ namespace SaifFuelMod
                 _wasEngineRunning = true;
 
                 float speedKmh = veh.Speed * 3.6f;
-                float speedPct = Math.Min(1f, speedKmh / 180f); // 0 stopped -> 1.0 near top speed
+                float movementFactor = Math.Min(1f, speedKmh / 180f); // 0 stopped -> 1.0 near top speed
 
                 float rpm = veh.CurrentRPM; // 0-1
                 float throttle = Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate);
-                float loadPct = Math.Min(1f, rpm * 0.5f + throttle * 0.5f);
+                float loadFactor = Math.Max(0.2f, Math.Min(1f, rpm * 0.5f + throttle * 0.5f));
 
-                // Slope: positive when climbing (nose pitched up), read from
-                // the vehicle's up vector Z tilt relative to its forward pitch.
+                // Slope: only matters while the vehicle is actually climbing
+                // under its own power, not just sitting on an incline.
                 float pitchDeg = Function.Call<float>(Hash.GET_ENTITY_PITCH, veh);
                 float slopePct = Math.Max(0f, Math.Min(1f, pitchDeg / 20f)); // 0 flat -> 1.0 at ~20deg+ climb
+                float slopeMult = 1f + slopePct * 0.45f; // up to +45% while climbing hard
 
-                // Off-road: no road node nearby = dirt/rock/uneven ground.
+                // BUG FIX: off-road used to add a flat penalty regardless of
+                // speed, so a parked off-road vehicle burned the same as one
+                // driving fast off-road. Terrain now only multiplies the
+                // MOVEMENT-based burn, so stopped = idle rate everywhere,
+                // and off-road only costs extra once you're actually moving.
                 bool onRoad = Function.Call<bool>(Hash.IS_POINT_ON_ROAD, veh.Position.X, veh.Position.Y, veh.Position.Z, veh);
-                float terrainPct = onRoad ? 0f : 1f;
+                float terrainMult = onRoad ? 1f : 1.45f;
 
-                // Weighted blend tuned so: clean road, full speed+load, flat
-                // -> ~50%. Off-road at similar pace -> ~70%. Full speed+load
-                // AND climbing AND off-road together -> ~100% (worst case).
-                float combined = speedPct * 0.30f + loadPct * 0.20f + terrainPct * 0.30f + slopePct * 0.20f;
-                combined = Math.Max(0.05f, Math.Min(1f, combined)); // idle floor so it's never literally zero
+                // idleBase = small constant burn just from the engine
+                // running, present even parked. Everything else only kicks
+                // in once you're moving: clean road/full speed+load -> ~50%
+                // of the gauge ceiling, off-road -> ~70%, off-road+uphill
+                // full load -> ~100% (worst case).
+                const float idleBase = 0.1f;
+                float modifier = idleBase + movementFactor * loadFactor * terrainMult * slopeMult;
 
-                float modifier = combined * 2.0f; // scale so combined=0.5 (clean road/full) lands near the mid-range burn rate
-                if (veh.ClassType == VehicleClass.Sports || veh.ClassType == VehicleClass.Super) modifier *= 1.15f;
-                if (veh.EngineHealth < 700f) modifier *= 1.3f;
+                if (veh.ClassType == VehicleClass.Sports || veh.ClassType == VehicleClass.Super) modifier *= 1.1f;
+                if (veh.EngineHealth < 700f) modifier *= 1.2f;
 
-                // Startup burst: fresh ignition burns rich for ~2.5s (cold
-                // start enrichment), then settles down to the normal curve -
-                // matches "start pe usage zyada, phir kam hoke normal se
-                // shuru hota hai" instead of a flat instant rate.
+                // Startup burst: a short rich-burn spike right after ignition
+                // (~1.5s), then settles down into the normal speed/load-based
+                // curve above instead of jumping straight to steady-state.
                 double sinceStart = (DateTime.Now - _engineStartTime).TotalSeconds;
-                if (sinceStart < 2.5) modifier *= (float)(1.8 - (sinceStart / 2.5) * 0.8);
+                if (sinceStart < 1.5) modifier *= (float)(2.0 - (sinceStart / 1.5) * 1.0);
 
                 modifier = Math.Min(modifier, 2.2f) * _fuelConsumeRate;
                 if (DateTime.Now < _slowConsumptionUntil) modifier *= 0.5f;
@@ -963,12 +975,26 @@ namespace SaifFuelMod
 
         private const float HOVER_DURATION_SECONDS = 12f;
         private const float HOSE_EXTEND_SECONDS = 1.5f;
+        private bool _hoseAttachRight = true;
+
+        // Finds a real rear-side tire position on the vehicle (left or
+        // right, picked once per delivery) using the model's actual bounding
+        // dimensions, transformed into world space - so the hose always
+        // plugs in near an actual wheel instead of the vehicle's center.
+        private Vector3 GetRearTireAttachPoint(Vehicle veh)
+        {
+            Vector3 min, max;
+            veh.Model.GetDimensions(out min, out max);
+            float sideOffset = _hoseAttachRight ? max.X * 0.9f : min.X * 0.9f;
+            Vector3 local = new Vector3(sideOffset, min.Y * 0.85f, min.Z + 0.15f);
+            return veh.GetOffsetPosition(local);
+        }
         private float _hoseExtendT = 0f;
 
         private void TryCallDelivery()
         {
             if (_deliveryPhase != DeliveryPhase.None) { ShowToast("~y~A delivery is already on its way."); return; }
-            if (_money < DELIVERY_COST) { ShowToast($"~r~Not enough money (${DELIVERY_COST})."); return; }
+            if (_money < _deliveryCost) { ShowToast($"~r~Not enough money (${_deliveryCost})."); return; }
 
             Ped playerPed = Game.Player.Character;
 
@@ -994,11 +1020,12 @@ namespace SaifFuelMod
             _deliveryBlip.Name = "Fuel Delivery";
             _deliveryBlip.ShowRoute = true;
 
-            _money -= DELIVERY_COST;
+            _money -= _deliveryCost;
             _deliveryPhase = DeliveryPhase.Inbound;
+            _hoseAttachRight = Rand.Next(2) == 0;
             _deliveryFlightT = 0f;
             _deliveryFillProgress = 0f;
-            ShowToast($"~g~Fuel delivery dispatched~w~ (${DELIVERY_COST}). Watch the sky above you.");
+            ShowToast($"~g~Fuel delivery dispatched~w~ (${_deliveryCost}). Watch the sky above you.");
         }
 
         private void UpdateDelivery()
@@ -1044,13 +1071,19 @@ namespace SaifFuelMod
                         // hose visibly LOWERS from the heli down to the fuel
                         // cap first, then refuel only starts once it's fully
                         // extended/attached - not both happening instantly.
-                        Vector3 attachPoint = playerPed.IsInVehicle() ? playerPed.CurrentVehicle.Position : playerPed.Position;
+                        // Attach point is a real rear-side tire position
+                        // (left or right, picked once per delivery) instead
+                        // of the vehicle's center, so it looks like it's
+                        // actually plugged into the fuel cap by the wheel.
+                        Vector3 attachPoint = playerPed.IsInVehicle()
+                            ? GetRearTireAttachPoint(playerPed.CurrentVehicle)
+                            : playerPed.Position;
                         Vector3 hoseAnchor = hoverPos + new Vector3(0, 0, -3f);
-                        Vector3 hoseTargetEnd = attachPoint + new Vector3(0, 0, 1f);
+                        Vector3 hoseTargetEnd = attachPoint + new Vector3(0, 0, 0.3f);
 
                         _hoseExtendT = Math.Min(1f, _hoseExtendT + Game.LastFrameTime / HOSE_EXTEND_SECONDS);
                         Vector3 hoseEnd = Vector3.Lerp(hoseAnchor, hoseTargetEnd, _hoseExtendT);
-                        DrawFuelHose(hoseAnchor, hoseEnd, Color.FromArgb(230, 255, 200, 60));
+                        DrawFuelHose(hoseAnchor, hoseEnd, Color.FromArgb(235, 220, 170, 40));
 
                         bool attached = _hoseExtendT >= 1f;
                         if (attached)
@@ -1114,13 +1147,23 @@ namespace SaifFuelMod
             bool fromOk = WorldToScreen(fromWorld, out float x1, out float y1);
             if (!fromOk) { x1 = x2; y1 = 0f; } // heli off top of frame - hose comes down from the top edge
 
-            const int SEGMENTS = 16;
+            // Dense, overlapping segments (no gaps) with a slight sideways
+            // sag partway down reads as a solid hanging rope/pipe instead of
+            // a spaced-out dotted line.
+            const int SEGMENTS = 40;
+            float dx = x2 - x1, dy = y2 - y1;
+            float len = (float)Math.Sqrt(dx * dx + dy * dy);
+            float sagAmount = Math.Min(18f, len * 0.06f);
+            Color coreColor = Color.FromArgb(color.A, Math.Max(0, color.R - 60), Math.Max(0, color.G - 60), Math.Max(0, color.B - 60));
+
             for (int i = 0; i <= SEGMENTS; i++)
             {
                 float t = i / (float)SEGMENTS;
-                float px = x1 + (x2 - x1) * t;
-                float py = y1 + (y2 - y1) * t;
-                new ContainerElement(new PointF(px - 3, py - 3), new SizeF(6, 6), color).Draw();
+                float sag = (float)Math.Sin(t * Math.PI) * sagAmount; // bows outward at the midpoint like real rope slack
+                float px = x1 + dx * t + sag;
+                float py = y1 + dy * t;
+                new ContainerElement(new PointF(px - 4, py - 4), new SizeF(8, 8), color).Draw();
+                new ContainerElement(new PointF(px - 2, py - 2), new SizeF(4, 4), coreColor).Draw();
             }
         }
 
@@ -1176,8 +1219,9 @@ namespace SaifFuelMod
             float labelH = 18f * _hudScale;
 
             float panelX = _hudOffsetX;
-            float panelW = tankW * 2f + tankGap;
-            // shared box for both tanks, with room above for % and below for labels
+            bool showThrust = veh != null && veh.ClassType == VehicleClass.Planes;
+            float panelW = tankW * (showThrust ? 3f : 2f) + tankGap * (showThrust ? 2f : 1f);
+            // shared box for both/all tanks, with room above for % and below for labels
             new ContainerElement(new PointF(panelX - 8, tankTop - 28), new SizeF(panelW + 16, tankHeight + 28 + labelH + 10), Color.FromArgb(160, 0, 0, 0)).Draw();
 
             // ---- FUEL TANK ----
@@ -1206,6 +1250,21 @@ namespace SaifFuelMod
             string usagePctText = $"{(int)Math.Round(_displayedUsagePct * 100f)}%";
             new TextElement(usagePctText, new PointF(usageX + tankW / 2f - 12f, tankTop - 24f), 0.26f, Color.White, Font.ChaletLondon).Draw();
             new TextElement("USE", new PointF(usageX + tankW / 2f - 12f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
+
+            // ---- JET THRUST TANK (jets only) ----
+            if (showThrust)
+            {
+                float thrustPct = Math.Max(veh.CurrentRPM, Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate));
+                _displayedThrustPct += (thrustPct - _displayedThrustPct) * Math.Min(1f, Game.LastFrameTime * 5f);
+
+                float thrustX = usageX + tankW + tankGap;
+                Color thrustColor = Color.Cyan;
+                DrawFuelTank(thrustX, tankTop, tankW, tankHeight, _displayedThrustPct, thrustColor, thrustColor, false);
+
+                string thrustPctText = $"{(int)Math.Round(_displayedThrustPct * 100f)}%";
+                new TextElement(thrustPctText, new PointF(thrustX + tankW / 2f - 12f, tankTop - 24f), 0.26f, Color.White, Font.ChaletLondon).Draw();
+                new TextElement("THR", new PointF(thrustX + tankW / 2f - 12f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
+            }
 
             if (_hudMoveMode)
             {
@@ -1260,6 +1319,7 @@ namespace SaifFuelMod
         // threat when lined up on you.
         // =================================================================
         private const float THREAT_SCAN_RADIUS = 2200f;
+        private const float CIVILIAN_SHOW_RADIUS = 350f; // non-hostile aircraft only show up this close
         private const float MISSILE_LOCK_RANGE = 600f;
         private const float MISSILE_LOCK_CONE_DOT = 0.80f; // ~37 degrees, wide catch cone
         private DateTime _lastThreatBeep = DateTime.MinValue;
@@ -1274,6 +1334,7 @@ namespace SaifFuelMod
             Vehicle myVeh = active ? playerPed.CurrentVehicle : null;
 
             UpdatePlayerMissiles(playerPed, active, myVeh);
+            UpdateEnemyMissiles(playerPed, active, myVeh);
             UpdateFlares(playerPed, active, myVeh);
 
             if (!active)
@@ -1293,19 +1354,32 @@ namespace SaifFuelMod
                 Ped driver = v.Driver;
                 if (driver == null || !driver.Exists() || driver.IsDead) continue;
 
-                // hostile = actively in combat, OR the game's own
-                // relationship system already flags this ped as hating the
-                // player, OR a known military response model at wanted 3+ -
-                // much broader net than combat-flag alone, since that flag
-                // can lag a frame or two behind an aircraft that's already
-                // attacking.
+                float dist = v.Position.DistanceTo(myVeh.Position);
+
+                // BUG FIX: the relationship-hate check was flagging nearly
+                // every aircraft as hostile (default civilian relationship
+                // groups apparently weren't reading as expected), which is
+                // why every plane showed red. Hostility now comes ONLY from
+                // an actual combat flag against the player, or a confirmed
+                // military response vehicle model at high wanted level -
+                // both far more reliable signals.
                 bool inCombat = Function.Call<bool>(Hash.IS_PED_IN_COMBAT, driver, playerPed);
-                int relationship = Function.Call<int>(Hash.GET_RELATIONSHIP_BETWEEN_PEDS, driver, playerPed);
-                bool relHostile = relationship >= 5; // 5=hate, 4=dislike+ also counts as unfriendly
                 VehicleHash vh = (VehicleHash)v.Model.Hash;
                 bool isMilitaryModel = vh == VehicleHash.Hunter || vh == VehicleHash.Lazer || vh == VehicleHash.Besra || vh == VehicleHash.Savage;
-                bool hostile = inCombat || relHostile || (isMilitaryModel && Function.Call<int>(Hash.GET_PLAYER_WANTED_LEVEL, Game.Player) >= 3);
-                if (!hostile) continue;
+                bool hostile = inCombat || (isMilitaryModel && Function.Call<int>(Hash.GET_PLAYER_WANTED_LEVEL, Game.Player) >= 3);
+
+                if (!hostile)
+                {
+                    // Not a threat - only show it at all (green, informational)
+                    // once it's genuinely close, and it never contributes to
+                    // lock/aiming warnings.
+                    if (dist <= CIVILIAN_SHOW_RADIUS)
+                    {
+                        seenHandles.Add(v.Handle);
+                        SyncThreatBlip(v, locking: false, hostile: false);
+                    }
+                    continue;
+                }
 
                 // real native homing-lock state on the ENEMY aircraft itself -
                 // this is the ONLY thing that turns the blip orange, since
@@ -1314,7 +1388,6 @@ namespace SaifFuelMod
                 int lockState = Function.Call<int>(Hash.GET_VEHICLE_HOMING_LOCKON_STATE, v);
                 bool nativeLocked = lockState >= 2;
 
-                float dist = v.Position.DistanceTo(myVeh.Position);
                 Vector3 toMe = (myVeh.Position - v.Position).Normalized;
                 float aim = Vector3.Dot(v.ForwardVector, toMe);
                 // fallback for cannon-only aircraft: lined up and close =
@@ -1334,10 +1407,10 @@ namespace SaifFuelMod
                 if (aimingAtMe && !locking) anyAiming = true;
 
                 seenHandles.Add(v.Handle);
-                SyncThreatBlip(v, locking);
+                SyncThreatBlip(v, locking, hostile: true);
             }
 
-            // remove blips for vehicles no longer a threat (destroyed, fled, or de-hostiled)
+            // remove blips for vehicles no longer a threat or no longer nearby
             foreach (var handle in new List<int>(_threatBlips.Keys))
             {
                 if (seenHandles.Contains(handle)) continue;
@@ -1360,22 +1433,22 @@ namespace SaifFuelMod
             }
         }
 
-        // Creates/updates a real native Blip pinned to the hostile aircraft
-        // itself - GTA moves it on the minimap/main map automatically every
-        // frame as the aircraft flies, same as any other in-game blip.
-        // Icon matches the aircraft type: jet gets the Jet blip, helicopter
-        // gets the Helicopter blip, instead of one generic enemy icon.
-        private void SyncThreatBlip(Vehicle v, bool locking)
+        // Creates/updates a real native Blip pinned to the aircraft itself -
+        // GTA moves it on the minimap/main map automatically every frame.
+        // Icon matches the aircraft type (Jet vs Helicopter). Color: Green =
+        // nearby but not a threat, Red = hostile, Orange+flashing = real
+        // missile lock.
+        private void SyncThreatBlip(Vehicle v, bool locking, bool hostile)
         {
             if (!_threatBlips.TryGetValue(v.Handle, out Blip b) || b == null || !b.Exists())
             {
                 b = v.AddBlip();
                 b.Sprite = v.ClassType == VehicleClass.Helicopters ? BlipSprite.Helicopter : BlipSprite.Jet;
                 b.Scale = 0.9f;
-                b.Name = v.ClassType == VehicleClass.Helicopters ? "Hostile Helicopter" : "Hostile Jet";
                 _threatBlips[v.Handle] = b;
             }
-            b.Color = locking ? BlipColor.Orange : BlipColor.Red;
+            b.Name = !hostile ? "Aircraft" : (v.ClassType == VehicleClass.Helicopters ? "Hostile Helicopter" : "Hostile Jet");
+            b.Color = !hostile ? BlipColor.Green : (locking ? BlipColor.Orange : BlipColor.Red);
             b.IsFlashing = locking;
         }
 
@@ -1482,6 +1555,106 @@ namespace SaifFuelMod
         }
 
         // =================================================================
+        // ENEMY MISSILE SIMULATION - GTA doesn't expose enemy-fired
+        // projectile entities either, so once a hostile aircraft's native
+        // homing lock (GET_VEHICLE_HOMING_LOCKON_STATE) has held for ~1.2s
+        // straight (long enough that a real pilot would have fired), a
+        // simulated enemy missile is spawned that homes in on the player -
+        // shown as a red blip on the main map, symmetric to "Your Missile".
+        // =================================================================
+        private class EnemyMissile { public Vector3 Position; public Vector3 Direction; public float LifeLeft; public Blip Blip; public int SourceHandle; }
+        private readonly List<EnemyMissile> _enemyMissiles = new List<EnemyMissile>();
+        private readonly Dictionary<int, float> _lockHoldSeconds = new Dictionary<int, float>();
+        private readonly HashSet<int> _alreadyFiredAt = new HashSet<int>();
+        private const float ENEMY_FIRE_LOCK_HOLD = 1.2f;
+        private const float ENEMY_MISSILE_SPEED = 260f;
+        private const float ENEMY_MISSILE_LIFETIME = 7f;
+        private const float ENEMY_MISSILE_TURN_RATE = 3.0f;
+
+        private void UpdateEnemyMissiles(Ped playerPed, bool active, Vehicle myVeh)
+        {
+            if (active)
+            {
+                foreach (var kvp in _threatBlips)
+                {
+                    int handle = kvp.Key;
+                    bool locking = kvp.Value != null && kvp.Value.Exists() && kvp.Value.Color == BlipColor.Orange;
+
+                    if (locking)
+                    {
+                        _lockHoldSeconds.TryGetValue(handle, out float held);
+                        held += Game.LastFrameTime;
+                        _lockHoldSeconds[handle] = held;
+
+                        if (held >= ENEMY_FIRE_LOCK_HOLD && !_alreadyFiredAt.Contains(handle))
+                        {
+                            var src = Entity.FromHandle(handle);
+                            if (src != null && src.Exists())
+                            {
+                                var em = new EnemyMissile
+                                {
+                                    Position = src.Position,
+                                    Direction = (myVeh.Position - src.Position).Normalized,
+                                    LifeLeft = ENEMY_MISSILE_LIFETIME,
+                                    SourceHandle = handle
+                                };
+                                em.Blip = World.CreateBlip(em.Position);
+                                em.Blip.Sprite = BlipSprite.Standard;
+                                em.Blip.Color = BlipColor.Red;
+                                em.Blip.Scale = 0.7f;
+                                em.Blip.Name = "Enemy Missile";
+                                em.Blip.IsFlashing = true;
+                                _enemyMissiles.Add(em);
+                                _alreadyFiredAt.Add(handle);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _lockHoldSeconds[handle] = 0f;
+                        _alreadyFiredAt.Remove(handle);
+                    }
+                }
+            }
+            else
+            {
+                _lockHoldSeconds.Clear();
+                _alreadyFiredAt.Clear();
+            }
+
+            for (int i = _enemyMissiles.Count - 1; i >= 0; i--)
+            {
+                var em = _enemyMissiles[i];
+
+                if (active && myVeh != null)
+                {
+                    Vector3 toPlayer = (myVeh.Position - em.Position).Normalized;
+                    float turnStep = ENEMY_MISSILE_TURN_RATE * Game.LastFrameTime;
+                    em.Direction = Vector3.Lerp(em.Direction, toPlayer, Math.Min(1f, turnStep)).Normalized;
+                }
+
+                em.Position += em.Direction * ENEMY_MISSILE_SPEED * Game.LastFrameTime;
+                em.LifeLeft -= Game.LastFrameTime;
+                if (em.Blip != null && em.Blip.Exists()) em.Blip.Position = em.Position;
+
+                bool hitPlayer = active && myVeh != null && myVeh.Position.DistanceTo(em.Position) < 15f;
+
+                if (em.LifeLeft <= 0f || hitPlayer || !active)
+                {
+                    if (em.Blip != null && em.Blip.Exists()) em.Blip.Delete();
+                    _enemyMissiles.RemoveAt(i);
+                }
+            }
+        }
+
+        private void ClearEnemyMissiles()
+        {
+            foreach (var em in _enemyMissiles)
+                if (em.Blip != null && em.Blip.Exists()) em.Blip.Delete();
+            _enemyMissiles.Clear();
+        }
+
+        // =================================================================
         // FLARES - countermeasure against enemy missile locks. Press Space
         // flying to pop a flare: shows as a real yellow blip drifting behind
         // the aircraft (native blip on the main map, no overlay), and rolls
@@ -1531,7 +1704,7 @@ namespace SaifFuelMod
         {
             if (active)
             {
-                bool keyDown = Game.IsKeyPressed(Keys.Space);
+                bool keyDown = Game.IsKeyPressed(Keys.E);
                 if (keyDown && !_wasFlareKeyDownLastTick) FireFlare(myVeh);
                 _wasFlareKeyDownLastTick = keyDown;
             }
@@ -1657,6 +1830,7 @@ namespace SaifFuelMod
                                     _priceRegular = float.Parse(parts[2]);
                                     _priceDiesel = float.Parse(parts[3]);
                                     if (parts.Length >= 5) _pricePremium = float.Parse(parts[4]);
+                                    if (parts.Length >= 6) _deliveryCost = (int)float.Parse(parts[5]);
                                 }
                                 break;
                             }
@@ -1699,7 +1873,8 @@ namespace SaifFuelMod
                 lines.Add("[CONFIG]");
                 lines.Add(string.Join("|",
                     _fuelConsumeRate.ToString("F2"), _refuelSpeed.ToString("F1"),
-                    _priceRegular.ToString("F2"), _priceDiesel.ToString("F2"), _pricePremium.ToString("F2")));
+                    _priceRegular.ToString("F2"), _priceDiesel.ToString("F2"), _pricePremium.ToString("F2"),
+                    _deliveryCost.ToString()));
 
                 lines.Add("[HUD]");
                 lines.Add($"{_hudOffsetX:F0}|{_hudOffsetY:F0}|{_hudScale:F1}");
