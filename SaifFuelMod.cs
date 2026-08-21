@@ -1023,14 +1023,9 @@ namespace SaifFuelMod
         // right, picked once per delivery) using the model's actual bounding
         // dimensions, transformed into world space - so the hose always
         // plugs in near an actual wheel instead of the vehicle's center.
+        // Recomputed fresh every frame from the vehicle's LIVE position, so
+        // the hose visually tracks it in real time with no physics risk.
         private Vector3 GetRearTireAttachPoint(Vehicle veh)
-        {
-            return veh.GetOffsetPosition(GetRearTireLocalOffset(veh));
-        }
-
-        // Same tire spot, but as a LOCAL (vehicle-relative) offset - this is
-        // what ATTACH_ENTITIES_TO_ROPE actually wants for the target entity.
-        private Vector3 GetRearTireLocalOffset(Vehicle veh)
         {
             var minOut = new OutputArgument();
             var maxOut = new OutputArgument();
@@ -1038,54 +1033,11 @@ namespace SaifFuelMod
             Vector3 min = minOut.GetResult<Vector3>();
             Vector3 max = maxOut.GetResult<Vector3>();
             float sideOffset = _hoseAttachRight ? max.X * 0.9f : min.X * 0.9f;
-            return new Vector3(sideOffset, min.Y * 0.85f, min.Z + 0.15f);
-        }
-
-        // =================================================================
-        // REAL NATIVE ROPE - the hose is a genuine GTA rope object attached
-        // to the helicopter and the vehicle's rear tire, simulated and
-        // rendered by the game itself every frame. It naturally stays
-        // connected and sways as either entity moves, instead of a redrawn
-        // 2D line that lags behind.
-        // =================================================================
-        private int _hoseRopeHandle = -1;
-        private bool _ropeTexturesRequested = false;
-
-        private void EnsureHoseRope(Vehicle heli, Vehicle targetVeh)
-        {
-            if (!_ropeTexturesRequested)
-            {
-                Function.Call(Hash.ROPE_LOAD_TEXTURES);
-                _ropeTexturesRequested = true;
-            }
-            if (_hoseRopeHandle != -1) return; // already attached for this hover
-            if (!Function.Call<bool>(Hash.ROPE_ARE_TEXTURES_LOADED)) return; // wait a frame or two for load
-
-            Vector3 start = heli.Position;
-            _hoseRopeHandle = Function.Call<int>(Hash.ADD_ROPE,
-                start.X, start.Y, start.Z, 0f, 0f, 0f,
-                6.0f,   // initial length
-                3,      // rope type (thin cable)
-                15.0f,  // max length
-                0.2f,   // min length
-                1.0f,   // length change rate
-                false, false, false, true, 1.0f);
-
-            Vector3 tireLocal = GetRearTireLocalOffset(targetVeh);
-            Function.Call(Hash.ATTACH_ENTITIES_TO_ROPE, _hoseRopeHandle, heli, targetVeh,
-                0f, 0f, -2f,
-                tireLocal.X, tireLocal.Y, tireLocal.Z,
-                12.0f, false, false, "", "");
-        }
-
-        private void DeleteHoseRope()
-        {
-            if (_hoseRopeHandle == -1) return;
-            var ropeArg = new OutputArgument(_hoseRopeHandle);
-            Function.Call(Hash.DELETE_ROPE, ropeArg);
-            _hoseRopeHandle = -1;
+            Vector3 local = new Vector3(sideOffset, min.Y * 0.85f, min.Z + 0.15f);
+            return veh.GetOffsetPosition(local);
         }
         private float _hoseExtendT = 0f;
+        private int _hoverTargetVehicleHandle = -1;
         // City buildings top out well under 200m (Maze Bank Tower is the
         // tallest at ~200m), while GTA's mountains (Chiliad, Tongva, the
         // Vinewood hills) sit at real elevated Z values themselves. Basing
@@ -1105,6 +1057,7 @@ namespace SaifFuelMod
             if (_money < _deliveryCost) { ShowToast($"~r~Not enough money (${_deliveryCost})."); return; }
 
             Ped playerPed = Game.Player.Character;
+            if (!playerPed.IsInVehicle()) { ShowToast("~r~Get in a vehicle first - there's no jerry can to fill on foot."); return; }
 
             _deliveryTargetPos = playerPed.Position + new Vector3(0, 0, 22f); // hover height above player
             _deliveryStartPos = playerPed.Position + new Vector3(0, 0, GetCruiseAltitude(playerPed.Position)) + (playerPed.ForwardVector * -500f);
@@ -1151,6 +1104,13 @@ namespace SaifFuelMod
             {
                 case DeliveryPhase.Inbound:
                     {
+                        if (!playerPed.IsInVehicle())
+                        {
+                            ShowToast("~y~Delivery cancelled~w~ - you left the vehicle.");
+                            CleanupDelivery();
+                            break;
+                        }
+
                         // BUG FIX: this used to lerp straight from the spawn
                         // point to the low ~22m hover height the whole way,
                         // so on a straight-line path across mountainous
@@ -1181,6 +1141,13 @@ namespace SaifFuelMod
 
                 case DeliveryPhase.Descending:
                     {
+                        if (!playerPed.IsInVehicle())
+                        {
+                            ShowToast("~y~Delivery cancelled~w~ - you left the vehicle.");
+                            CleanupDelivery();
+                            break;
+                        }
+
                         _deliveryFlightT += Game.LastFrameTime / 3.5f;
                         float t = Math.Min(1f, _deliveryFlightT);
                         Vector3 from = playerPed.Position + new Vector3(0, 0, GetCruiseAltitude(playerPed.Position));
@@ -1194,45 +1161,44 @@ namespace SaifFuelMod
                             _deliveryPhase = DeliveryPhase.Hovering;
                             _deliveryFillProgress = 0f;
                             _hoseExtendT = 0f;
+                            _hoverTargetVehicleHandle = playerPed.CurrentVehicle.Handle;
                         }
                         break;
                     }
 
                 case DeliveryPhase.Hovering:
                     {
+                        // If the player switched vehicles or got out since
+                        // the hover started, a hose can't follow them onto
+                        // a different car - cancel cleanly instead of
+                        // leaving the delivery in a broken/stuck state.
+                        bool stillSameVehicle = playerPed.IsInVehicle() &&
+                            playerPed.CurrentVehicle.Handle == _hoverTargetVehicleHandle &&
+                            playerPed.CurrentVehicle.Exists();
+                        if (!stillSameVehicle)
+                        {
+                            ShowToast("~y~Delivery cancelled~w~ - you left the vehicle.");
+                            CleanupDelivery();
+                            break;
+                        }
+
                         // stay locked above the player, facing down toward them
                         Vector3 hoverPos = playerPed.Position + new Vector3(0, 0, 22f);
                         MovePlaneTo(hoverPos, faceDown: true);
 
-                        bool inVeh = playerPed.IsInVehicle();
-                        Vehicle targetVeh = inVeh ? playerPed.CurrentVehicle : null;
-
-                        if (inVeh)
-                        {
-                            // REAL native rope, physically attached to the
-                            // heli and the vehicle's rear tire - GTA
-                            // simulates and renders this every frame on its
-                            // own, so it genuinely stays connected as either
-                            // one moves, instead of a redrawn 2D line that
-                            // visibly lags a frame behind.
-                            EnsureHoseRope(_deliveryPlane, targetVeh);
-                        }
-                        else
-                        {
-                            // on-foot fallback: no vehicle to attach a real
-                            // rope to, use the old screen-space hose instead
-                            DeleteHoseRope();
-                            Vector3 hoseAnchor = hoverPos + new Vector3(0, 0, -3f);
-                            Vector3 hoseTargetEnd = playerPed.Position + new Vector3(0, 0, 0.3f);
-                            Vector3 hoseEnd = Vector3.Lerp(hoseAnchor, hoseTargetEnd, _hoseExtendT);
-                            DrawFuelHose(hoseAnchor, hoseEnd, Color.FromArgb(235, 220, 170, 40));
-                        }
-
-                        // hose "extending" still gates when the fill
-                        // actually starts, even though the rope itself is
-                        // already attached - gives a beat of lowering time
-                        // before fuel starts flowing.
+                        // Hose recomputed fresh from LIVE positions every
+                        // single frame - both ends always match exactly
+                        // where the heli and vehicle actually are right now,
+                        // so it visually tracks in real time with zero
+                        // physics risk (previous native-rope version could
+                        // yank the vehicle away if you swapped cars).
+                        Vector3 attachPoint = GetRearTireAttachPoint(playerPed.CurrentVehicle);
+                        Vector3 hoseAnchor = hoverPos + new Vector3(0, 0, -3f);
+                        Vector3 hoseTargetEnd = attachPoint + new Vector3(0, 0, 0.3f);
                         _hoseExtendT = Math.Min(1f, _hoseExtendT + Game.LastFrameTime / HOSE_EXTEND_SECONDS);
+                        Vector3 hoseEnd = Vector3.Lerp(hoseAnchor, hoseTargetEnd, _hoseExtendT);
+                        DrawFuelHose(hoseAnchor, hoseEnd, Color.FromArgb(235, 220, 170, 40));
+
                         bool attached = _hoseExtendT >= 1f;
                         if (attached)
                         {
@@ -1253,7 +1219,6 @@ namespace SaifFuelMod
                         {
                             ShowToast("~g~Tank filled by air delivery!");
                             SaveAllData();
-                            DeleteHoseRope();
                             _deliveryPhase = DeliveryPhase.Leaving;
                             _deliveryFlightT = 0f;
                         }
@@ -1341,7 +1306,6 @@ namespace SaifFuelMod
 
         private void CleanupDelivery()
         {
-            DeleteHoseRope();
             if (_deliveryBlip != null && _deliveryBlip.Exists()) _deliveryBlip.Delete();
             if (_deliveryPilot != null && _deliveryPilot.Exists()) _deliveryPilot.Delete();
             if (_deliveryPlane != null && _deliveryPlane.Exists()) _deliveryPlane.Delete();
