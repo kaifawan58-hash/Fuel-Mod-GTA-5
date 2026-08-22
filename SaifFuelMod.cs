@@ -1619,7 +1619,15 @@ namespace SaifFuelMod
                 VehicleHash vh = (VehicleHash)v.Model.Hash;
                 bool isMilitaryModel = vh == VehicleHash.Hunter || vh == VehicleHash.Lazer || vh == VehicleHash.Besra || vh == VehicleHash.Savage;
                 int wantedLevel = Function.Call<int>(Hash.GET_PLAYER_WANTED_LEVEL, Game.Player);
-                bool isPursuingCop = Function.Call<bool>(Hash.IS_PED_A_COP, driver) && wantedLevel >= 1;
+                // COMPILE FIX: Hash.IS_PED_A_COP doesn't exist in this
+                // SHVDN version's Hash enum (build error CS0117). Police are
+                // detected instead via the ped's relationship group hash
+                // (vanilla law-enforcement peds are in the "COP" group) OR
+                // the police helicopter model directly - both use natives
+                // that genuinely exist.
+                int driverRelGroup = Function.Call<int>(Hash.GET_PED_RELATIONSHIP_GROUP_HASH, driver);
+                bool isCopPed = driverRelGroup == Game.GenerateHash("COP") || vh == VehicleHash.Polmav;
+                bool isPursuingCop = isCopPed && wantedLevel >= 1;
                 bool hostile = inCombat || (isMilitaryModel && wantedLevel >= 3) || isPursuingCop;
 
                 if (!hostile)
