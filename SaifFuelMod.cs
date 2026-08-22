@@ -9,7 +9,10 @@
 //    Repair Vehicle, Buy Now Use Later.
 //  - F7 opens Settings: consumption/refuel rates, prices, HUD position/scale.
 //  - Fuel delivery: call it with H, a helicopter flies in, hovers over you
-//    with a hose visual and fills your tank with a progress bar.
+//    with a hose visual and fills your tank with a progress bar. For land
+//    vehicles this is an EMERGENCY-ONLY top-up (see TryCallDelivery) since
+//    they can just drive to a pump - it only tops up enough fuel to reach
+//    the nearest station, and can optionally auto-set a waypoint there.
 //  - Fuel quality varies per station (shown by pump blip color) and affects
 //    vehicle top speed after refueling there.
 //  - Real per-machine station coordinates, dynamic hour/weekend/weather/
@@ -41,12 +44,11 @@ namespace SaifFuelMod
         private class Machine
         {
             public Vector3 Position;
-            // 0.80-1.20 - drives the vehicle top-speed modifier after
-            // refueling from THIS specific pump (see ApplyFuelQualityToVehicle).
-            // Every machine at a station rolls its own quality, so even
-            // pumps standing right next to each other at the same station
-            // can differ - matches how a real station can have one pump
-            // running cleaner fuel than its neighbor.
+            // Drives the vehicle top-speed modifier after refueling from
+            // THIS specific pump (see ApplyFuelQualityToVehicle). Every
+            // machine at a station rolls its own quality, biased by fuel
+            // type and location - so even pumps standing right next to each
+            // other at the same station can differ.
             public float Quality = 1f;
         }
 
@@ -58,9 +60,13 @@ namespace SaifFuelMod
             public float RegionPriceMult = 1f;
             public bool OutOfStock;
             public DateTime OutOfStockUntil = DateTime.MinValue;
-            // Average of all machines - only used for the map blip color,
-            // giving a rough "overall" read of this station before arriving.
-            public float FuelQuality => Machines.Count > 0 ? Machines.Values.Average(m => m.Quality) : 1f;
+            // Independent random roll for the map blip color, biased by
+            // location (mountain = rougher/redder, city = cleaner/greener).
+            // Deliberately NOT the average of the machines - averaging
+            // several independent rolls regresses toward the middle, which
+            // is why almost every station used to show up yellow regardless
+            // of the actual spread underneath.
+            public float BlipQuality = 1f;
         }
 
         private readonly List<Station> _stations = new List<Station>();
@@ -70,22 +76,40 @@ namespace SaifFuelMod
             void Add(string name, params (string type, float x, float y, float z)[] machines)
             {
                 var s = new Station { Name = name };
-                foreach (var m in machines)
-                {
-                    s.Machines[m.type] = new Machine
-                    {
-                        Position = new Vector3(m.x, m.y, m.z),
-                        Quality = 0.80f + (float)Rand.NextDouble() * 0.40f
-                    };
-                }
 
                 float avgZ = 0f;
-                foreach (var mv in s.Machines.Values) avgZ += mv.Position.Z;
-                avgZ /= Math.Max(1, s.Machines.Count);
+                foreach (var m in machines) avgZ += m.z;
+                avgZ /= Math.Max(1, machines.Length);
                 s.IsMountain = avgZ > 90f;
+
+                foreach (var m in machines)
+                {
+                    // Premium fuel is consistently good wherever it's sold
+                    // (that's the point of paying more for it) - city areas
+                    // lean toward better-maintained regular/diesel pumps
+                    // too, while remote mountain stations run rougher,
+                    // lower-quality fuel on average.
+                    float quality;
+                    if (m.type == "Premium")
+                        quality = 1.00f + (float)Rand.NextDouble() * 0.30f; // 1.00-1.30, always solid
+                    else if (s.IsMountain)
+                        quality = 0.65f + (float)Rand.NextDouble() * 0.35f; // 0.65-1.00, rougher out in the hills
+                    else
+                        quality = 0.85f + (float)Rand.NextDouble() * 0.35f; // 0.85-1.20, decent city/coastal baseline
+
+                    s.Machines[m.type] = new Machine { Position = new Vector3(m.x, m.y, m.z), Quality = quality };
+                }
+
                 s.RegionPriceMult = s.IsMountain
                     ? 1.10f + (float)Rand.NextDouble() * 0.20f
                     : 0.95f + (float)Rand.NextDouble() * 0.15f;
+
+                // Blip color roll - same location bias as the machines
+                // above, but independent so the map genuinely shows a mix
+                // of red/yellow/green instead of clustering in the middle.
+                s.BlipQuality = s.IsMountain
+                    ? 0.65f + (float)Rand.NextDouble() * 0.45f  // 0.65-1.10, mostly red/yellow
+                    : 0.80f + (float)Rand.NextDouble() * 0.45f; // 0.80-1.25, mostly yellow/green
 
                 _stations.Add(s);
             }
@@ -158,6 +182,11 @@ namespace SaifFuelMod
         private float _priceDiesel = 1.42f;
         private float _pricePremium = 1.65f;
         private float _priceElectric = 0.45f;
+        // BUG FIX: this checkbox was being built and used (in TryCallDelivery)
+        // without ever being declared as a field - that's a compile error
+        // (CS0103) the whole script wouldn't build. Declared here now.
+        // Default OFF, matching "only auto-waypoint if the box is checked".
+        private bool _autoWaypointEnabled = false;
         private const string DataPath = "scripts\\SaifFuelMod_data.txt";
 
         // HUD placement/scale - fully custom position, no preset corners
@@ -231,6 +260,9 @@ namespace SaifFuelMod
         private NativeListItem<float> _priceDieselItem;
         private NativeListItem<float> _pricePremiumItem;
         private NativeListItem<int> _deliveryCostItem;
+        // BUG FIX: same missing-declaration problem as _autoWaypointEnabled
+        // above - this checkbox item itself was never declared as a field.
+        private NativeCheckboxItem _autoWaypointItem;
         private NativeListItem<int> _hudOffsetXItem;
         private NativeListItem<int> _hudOffsetYItem;
         private NativeListItem<float> _hudScaleItem;
@@ -257,7 +289,7 @@ namespace SaifFuelMod
 
             Tick += OnTick;
             KeyDown += OnKeyDown;
-            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); ClearPlayerMissiles(); ClearEnemyMissiles(); ClearFlares(); };
+            Aborted += (s, e) => { SaveAllData(); CleanupDelivery(); ClearThreatBlips(); ClearPlayerMissiles(); ClearEnemyMissiles(); ClearFlares(); StopJetThrustFX(); };
         }
 
         // =================================================================
@@ -344,6 +376,12 @@ namespace SaifFuelMod
             SelectClosest(_deliveryCostItem, _deliveryCost);
             _deliveryCostItem.ItemChanged += (s, e) => _deliveryCost = _deliveryCostItem.SelectedItem;
 
+            // Optional auto-waypoint: only ticks a waypoint to the nearest
+            // pump when the land-vehicle emergency delivery kicks in, and
+            // only if this box is checked - unchecked means never auto-set.
+            _autoWaypointItem = new NativeCheckboxItem("Auto-Waypoint to Nearest Pump", _autoWaypointEnabled);
+            _autoWaypointItem.CheckboxChanged += (s, e) => { _autoWaypointEnabled = _autoWaypointItem.Checked; SaveAllData(); };
+
             _hudOffsetXItem = new NativeListItem<int>("HUD X Position", IntSteps(0, 1800, 10));
             SelectClosest(_hudOffsetXItem, (int)_hudOffsetX);
             _hudOffsetXItem.ItemChanged += (s, e) => _hudOffsetX = _hudOffsetXItem.SelectedItem;
@@ -365,6 +403,11 @@ namespace SaifFuelMod
             _settingsMenu.Add(_priceDieselItem);
             _settingsMenu.Add(_pricePremiumItem);
             _settingsMenu.Add(_deliveryCostItem);
+            // BUG FIX: _autoWaypointItem was built above but never added to
+            // the menu, so it would never actually appear in F7 no matter
+            // what. Added here, right after the delivery price (logically
+            // grouped with the delivery settings).
+            _settingsMenu.Add(_autoWaypointItem);
             _settingsMenu.Add(_hudOffsetXItem);
             _settingsMenu.Add(_hudOffsetYItem);
             _settingsMenu.Add(_hudScaleItem);
@@ -501,6 +544,21 @@ namespace SaifFuelMod
                 UpdateDelivery();
                 UpdateAmbientVehicles();
                 UpdateAircraftThreatRadar();
+                UpdateJetThrustFX();
+
+                // CRASH FIX: TryCallDelivery() (via H) used to be called
+                // directly from OnKeyDown, which spawns a vehicle/ped
+                // (World.CreateVehicle/CreatePed) - those internally yield,
+                // and yielding from inside a KeyDown callback is a known
+                // crash/hang risk in SHVDN. H now just sets a flag, and the
+                // actual spawn work runs here in the guaranteed-safe Tick
+                // context instead.
+                if (_deliveryRequested)
+                {
+                    _deliveryRequested = false;
+                    TryCallDelivery();
+                }
+
                 DrawToasts();
             }
             catch (Exception ex)
@@ -534,8 +592,8 @@ namespace SaifFuelMod
             Vector3 anchor = st.Machines.Values.First().Position;
             Blip b = World.CreateBlip(anchor);
             b.Sprite = BlipSprite.JerryCan;
-            b.Color = st.FuelQuality >= 1.05f ? BlipColor.Green
-                    : st.FuelQuality <= 0.95f ? BlipColor.Red
+            b.Color = st.BlipQuality >= 1.05f ? BlipColor.Green
+                    : st.BlipQuality <= 0.95f ? BlipColor.Red
                     : BlipColor.Yellow;
             b.Name = SHARED_BLIP_NAME;
             b.IsShortRange = true;
@@ -884,7 +942,16 @@ namespace SaifFuelMod
 
         private void ConfirmRepair()
         {
+            // CRASH FIX: CurrentVehicle can legitimately be null here if the
+            // player left the vehicle in the same frame the menu item was
+            // activated - GetRepairCost(null) used to dereference it
+            // straight away and take the whole script down.
             Vehicle veh = Game.Player.Character.CurrentVehicle;
+            if (veh == null || !veh.Exists())
+            {
+                ShowToast("~r~Get back in your vehicle first.");
+                return;
+            }
             float cost = GetRepairCost(veh);
             if (cost <= 0.5f) { ShowToast("~y~Your vehicle is in great condition."); return; }
             StartJob(ActiveJob.Repair, cost, "Repairing vehicle", 0);
@@ -1016,9 +1083,12 @@ namespace SaifFuelMod
         private const float DELIVERY_FLIGHT_SECONDS = 28f;
 
         private const float HOVER_DURATION_SECONDS = 12f;
+        private bool _isEmergencyLandDelivery = false;
+        private float _emergencyTargetLitres = 0f;
         private const float HOSE_EXTEND_SECONDS = 1.5f;
         private float _hoseExtendT = 0f;
         private int _hoverTargetVehicleHandle = -1;
+        private bool _deliveryRequested = false; // set by the H key, consumed in OnTick - see CRASH FIX above
         // City buildings top out well under 200m (Maze Bank Tower is the
         // tallest at ~200m), while GTA's mountains (Chiliad, Tongva, the
         // Vinewood hills) sit at real elevated Z values themselves. Basing
@@ -1039,6 +1109,45 @@ namespace SaifFuelMod
 
             Ped playerPed = Game.Player.Character;
             if (!playerPed.IsInVehicle()) { ShowToast("~r~Get in a vehicle first - there's no jerry can to fill on foot."); return; }
+
+            Vehicle myVeh = playerPed.CurrentVehicle;
+            bool isLandVehicle = myVeh.ClassType != VehicleClass.Boats &&
+                                  myVeh.ClassType != VehicleClass.Planes &&
+                                  myVeh.ClassType != VehicleClass.Helicopters;
+
+            // Air delivery's whole purpose is boats/planes stuck out where
+            // there's no pump to drive to - a land vehicle CAN just drive to
+            // one. So for land vehicles this is an emergency-only top-up:
+            // only usable once you're basically empty, and it only gives
+            // enough fuel to reach the nearest pump, not a full tank.
+            _isEmergencyLandDelivery = false;
+            _emergencyTargetLitres = 0f;
+            if (isLandVehicle)
+            {
+                if (_fuel > 1.0f)
+                {
+                    ShowToast("~y~Air delivery for land vehicles is emergency-only~w~ - wait until you're nearly empty, or drive to a pump for a full tank.");
+                    return;
+                }
+
+                var nearest = FindNearestStation(myVeh.Position);
+                if (nearest == null) { ShowToast("~r~No station found on the map."); return; }
+
+                float distToPump = nearest.Machines.Values.First().Position.DistanceTo(myVeh.Position);
+                // rough estimate: ~6.5L/100km at a modest cruising modifier,
+                // plus a flat safety buffer so you don't run dry 50m short
+                float estimatedLitres = (distToPump / 1000f) * 9f + 4f;
+                _emergencyTargetLitres = Math.Max(6f, Math.Min(_maxFuel * 0.5f, estimatedLitres));
+                _isEmergencyLandDelivery = true;
+
+                ShowToast($"~y~Emergency delivery~w~ - just enough to reach {nearest.Name} ({distToPump / 1000f:F1}km). Full refuel is only available at a pump.");
+
+                if (_autoWaypointEnabled)
+                {
+                    Vector3 pumpPos = nearest.Machines.Values.First().Position;
+                    Function.Call(Hash.SET_NEW_WAYPOINT, pumpPos.X, pumpPos.Y);
+                }
+            }
 
             _deliveryTargetPos = playerPed.Position + new Vector3(0, 0, 22f); // hover height above player
             _deliveryStartPos = playerPed.Position + new Vector3(0, 0, GetCruiseAltitude(playerPed.Position)) + (playerPed.ForwardVector * -500f);
@@ -1066,7 +1175,22 @@ namespace SaifFuelMod
             _deliveryPhase = DeliveryPhase.Inbound;
             _deliveryFlightT = 0f;
             _deliveryFillProgress = 0f;
-            ShowToast($"~g~Fuel delivery dispatched~w~ (${_deliveryCost}). Watch the sky above you.");
+            if (!isLandVehicle) ShowToast($"~g~Fuel delivery dispatched~w~ (${_deliveryCost}). Watch the sky above you.");
+        }
+
+        // Nearest station by straight-line distance to its anchor machine -
+        // used for the land-vehicle emergency delivery target and optional
+        // auto-waypoint.
+        private Station FindNearestStation(Vector3 pos)
+        {
+            Station best = null;
+            float bestDist = float.MaxValue;
+            foreach (var st in _stations)
+            {
+                float d = st.Machines.Values.First().Position.DistanceTo(pos);
+                if (d < bestDist) { bestDist = d; best = st; }
+            }
+            return best;
         }
 
         private void UpdateDelivery()
@@ -1178,19 +1302,24 @@ namespace SaifFuelMod
                             _deliveryFillProgress += Game.LastFrameTime / HOVER_DURATION_SECONDS;
                         }
                         float pct = Math.Min(1f, _deliveryFillProgress);
-                        _fuel = Math.Min(_maxFuel, _maxFuel * pct);
+                        float fillTarget = _isEmergencyLandDelivery ? _emergencyTargetLitres : _maxFuel;
+                        _fuel = Math.Min(fillTarget, fillTarget * pct);
 
                         // on-screen fill progress bar
                         float barX = 20f, barY = 90f;
                         new ContainerElement(new PointF(barX, barY), new SizeF(300, 30), Color.FromArgb(200, 20, 20, 20)).Draw();
                         new ContainerElement(new PointF(barX + 5, barY + 20), new SizeF(290, 6), Color.FromArgb(150, 60, 60, 60)).Draw();
                         new ContainerElement(new PointF(barX + 5, barY + 20), new SizeF(290 * (attached ? pct : _hoseExtendT), 6), Color.FromArgb(255, 255, 200, 60)).Draw();
-                        string label = attached ? $"Fuel delivery - filling tank... {(int)(pct * 100)}%" : "Fuel delivery - lowering hose...";
+                        string label = attached
+                            ? (_isEmergencyLandDelivery ? $"Emergency delivery - {(int)(pct * 100)}% (enough to reach the pump)" : $"Fuel delivery - filling tank... {(int)(pct * 100)}%")
+                            : "Fuel delivery - lowering hose...";
                         new TextElement(label, new PointF(barX + 5, barY + 2), 0.24f, Color.White, Font.ChaletLondon).Draw();
 
                         if (_deliveryFillProgress >= 1f)
                         {
-                            ShowToast("~g~Tank filled by air delivery!");
+                            ShowToast(_isEmergencyLandDelivery
+                                ? "~g~Enough fuel to reach the pump!~w~ Full refuel still needs a station visit."
+                                : "~g~Tank filled by air delivery!");
                             SaveAllData();
                             _deliveryPhase = DeliveryPhase.Leaving;
                             _deliveryFlightT = 0f;
@@ -1266,16 +1395,33 @@ namespace SaifFuelMod
             // shared box for both/all tanks, with room above for % and below for labels
             new ContainerElement(new PointF(panelX - 8, tankTop - 28), new SizeF(panelW + 16, tankHeight + 28 + labelH + 10), Color.FromArgb(160, 0, 0, 0)).Draw();
 
+            // ---- JET THRUST TANK (jets only, LEFTMOST) ----
+            float fuelX = panelX;
+            if (showThrust)
+            {
+                float thrustPct = Math.Max(veh.CurrentRPM, Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate));
+                _displayedThrustPct += (thrustPct - _displayedThrustPct) * Math.Min(1f, Game.LastFrameTime * 5f);
+
+                Color thrustColor = Color.Cyan;
+                DrawFuelTank(panelX, tankTop, tankW, tankHeight, _displayedThrustPct, thrustColor, thrustColor, false);
+
+                string thrustPctText = $"{(int)Math.Round(_displayedThrustPct * 100f)}%";
+                new TextElement(thrustPctText, new PointF(panelX + tankW / 2f - 12f, tankTop - 24f), 0.26f, Color.White, Font.ChaletLondon).Draw();
+                new TextElement("THR", new PointF(panelX + tankW / 2f - 12f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
+
+                fuelX = panelX + tankW + tankGap; // fuel/use shift right to make room
+            }
+
             // ---- FUEL TANK ----
             float fuelPct = _maxFuel > 0 ? _fuel / _maxFuel : 0f;
             _displayedFuelPct += (fuelPct - _displayedFuelPct) * Math.Min(1f, Game.LastFrameTime * 2.5f);
             bool fuelLow = fuelPct < 0.2f;
-            DrawFuelTank(panelX, tankTop, tankW, tankHeight, _displayedFuelPct, Color.LimeGreen, Color.Red, fuelLow);
+            DrawFuelTank(fuelX, tankTop, tankW, tankHeight, _displayedFuelPct, Color.LimeGreen, Color.Red, fuelLow);
 
             string fuelPctText = $"{(int)Math.Round(_displayedFuelPct * 100f)}%";
-            new TextElement(fuelPctText, new PointF(panelX + tankW / 2f - 12f, tankTop - 24f), 0.26f,
+            new TextElement(fuelPctText, new PointF(fuelX + tankW / 2f - 12f, tankTop - 24f), 0.26f,
                 fuelLow ? Color.Red : Color.White, Font.ChaletLondon).Draw();
-            new TextElement("FUEL", new PointF(panelX + tankW / 2f - 16f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
+            new TextElement("FUEL", new PointF(fuelX + tankW / 2f - 16f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
 
             // ---- CONSUMPTION TANK ----
             // Reference ceiling = the highest possible burn rate at the
@@ -1285,28 +1431,13 @@ namespace SaifFuelMod
             float usagePct = maxLps > 0f ? Math.Min(1f, _currentUsageLps / maxLps) : 0f;
             _displayedUsagePct += (usagePct - _displayedUsagePct) * Math.Min(1f, Game.LastFrameTime * 4f);
 
-            float usageX = panelX + tankW + tankGap;
+            float usageX = fuelX + tankW + tankGap;
             Color usageColor = Color.FromArgb(255, 255, 180, 40);
             DrawFuelTank(usageX, tankTop, tankW, tankHeight, _displayedUsagePct, usageColor, usageColor, false);
 
             string usagePctText = $"{(int)Math.Round(_displayedUsagePct * 100f)}%";
             new TextElement(usagePctText, new PointF(usageX + tankW / 2f - 12f, tankTop - 24f), 0.26f, Color.White, Font.ChaletLondon).Draw();
             new TextElement("USE", new PointF(usageX + tankW / 2f - 12f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
-
-            // ---- JET THRUST TANK (jets only) ----
-            if (showThrust)
-            {
-                float thrustPct = Math.Max(veh.CurrentRPM, Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate));
-                _displayedThrustPct += (thrustPct - _displayedThrustPct) * Math.Min(1f, Game.LastFrameTime * 5f);
-
-                float thrustX = usageX + tankW + tankGap;
-                Color thrustColor = Color.Cyan;
-                DrawFuelTank(thrustX, tankTop, tankW, tankHeight, _displayedThrustPct, thrustColor, thrustColor, false);
-
-                string thrustPctText = $"{(int)Math.Round(_displayedThrustPct * 100f)}%";
-                new TextElement(thrustPctText, new PointF(thrustX + tankW / 2f - 12f, tankTop - 24f), 0.26f, Color.White, Font.ChaletLondon).Draw();
-                new TextElement("THR", new PointF(thrustX + tankW / 2f - 12f, tankTop + tankHeight + 6f), 0.22f, Color.White, Font.ChaletLondon).Draw();
-            }
 
             if (_hudMoveMode)
             {
@@ -1368,6 +1499,86 @@ namespace SaifFuelMod
         private readonly Dictionary<int, Blip> _threatBlips = new Dictionary<int, Blip>();
         private readonly Dictionary<int, DateTime> _flareDetrackedUntil = new Dictionary<int, DateTime>();
 
+        // =================================================================
+        // JET THRUST VISUAL - a real looped particle effect attached to the
+        // vehicle's exhaust bone(s), so it visibly flares from the actual
+        // nozzle instead of a fake HUD-only indicator. Loops over every
+        // common exhaust bone name so it works whether the model has 1, 2,
+        // or 3+ exhausts (e.g. twin-nozzle jets like a KF-21 addon).
+        //
+        // NOTE: I can't run GTA V from here to verify these exact bone
+        // names against your specific KF-21 model - "exhaust"/"exhaust_2"
+        // are the common vanilla convention, and I've added a few of the
+        // other naming styles addon-plane creators commonly use. If neither
+        // nozzle shows flame, open the KF-21's .yft/.meta (or a bone-name
+        // viewer trainer) for its real bone names and tell me what they
+        // are - I'll swap the list to match exactly.
+        // =================================================================
+        private static readonly string[] ExhaustBoneNames =
+        {
+            "exhaust", "exhaust_2", "exhaust_3", "exhaust_4",
+            "exhaust_l", "exhaust_r", "afterburner_1", "afterburner_2"
+        };
+        private readonly Dictionary<string, int> _activeExhaustFx = new Dictionary<string, int>();
+        private bool _exhaustPtfxRequested = false;
+        private int _lastThrustVehicleHandle = -1;
+
+        private void UpdateJetThrustFX()
+        {
+            Ped playerPed = Game.Player.Character;
+            bool inJet = playerPed.IsInVehicle() && playerPed.CurrentVehicle.ClassType == VehicleClass.Planes;
+            Vehicle veh = inJet ? playerPed.CurrentVehicle : null;
+
+            if (!inJet || veh.Handle != _lastThrustVehicleHandle)
+            {
+                StopJetThrustFX();
+                _lastThrustVehicleHandle = inJet ? veh.Handle : -1;
+                if (!inJet) return;
+            }
+
+            if (!_exhaustPtfxRequested)
+            {
+                Function.Call(Hash.REQUEST_NAMED_PTFX_ASSET, "core");
+                _exhaustPtfxRequested = true;
+            }
+            if (!Function.Call<bool>(Hash.HAS_NAMED_PTFX_ASSET_LOADED, "core")) return;
+
+            float throttle = Game.GetControlValueNormalized(GTA.Control.VehicleAccelerate);
+            bool shouldFlare = throttle > 0.15f && veh.IsEngineRunning;
+
+            foreach (var boneName in ExhaustBoneNames)
+            {
+                int boneIdx = Function.Call<int>(Hash.GET_ENTITY_BONE_INDEX_BY_NAME, veh, boneName);
+                if (boneIdx == -1) continue; // this model doesn't have this exhaust - fine, others still run
+
+                bool hasActive = _activeExhaustFx.TryGetValue(boneName, out int fxHandle) && fxHandle != 0;
+
+                if (shouldFlare && !hasActive)
+                {
+                    Function.Call(Hash.USE_PARTICLE_FX_ASSET, "core");
+                    int newFx = Function.Call<int>(Hash.START_PARTICLE_FX_LOOPED_ON_ENTITY_BONE,
+                        "veh_backfire", veh, 0f, 0f, 0f, 0f, 0f, 0f, boneIdx, 1.0f, false, false, false);
+                    _activeExhaustFx[boneName] = newFx;
+                }
+                else if (shouldFlare && hasActive)
+                {
+                    Function.Call(Hash.SET_PARTICLE_FX_LOOPED_SCALE, fxHandle, 0.6f + throttle * 0.6f);
+                }
+                else if (!shouldFlare && hasActive)
+                {
+                    Function.Call(Hash.STOP_PARTICLE_FX_LOOPED, fxHandle, false);
+                    _activeExhaustFx.Remove(boneName);
+                }
+            }
+        }
+
+        private void StopJetThrustFX()
+        {
+            foreach (var fxHandle in _activeExhaustFx.Values)
+                Function.Call(Hash.STOP_PARTICLE_FX_LOOPED, fxHandle, false);
+            _activeExhaustFx.Clear();
+        }
+
         private void UpdateAircraftThreatRadar()
         {
             Ped playerPed = Game.Player.Character;
@@ -1387,7 +1598,6 @@ namespace SaifFuelMod
 
             var seenHandles = new HashSet<int>();
             bool anyLock = false;
-            bool anyAiming = false;
 
             foreach (Vehicle v in World.GetNearbyVehicles(myVeh.Position, THREAT_SCAN_RADIUS))
             {
@@ -1398,17 +1608,19 @@ namespace SaifFuelMod
 
                 float dist = v.Position.DistanceTo(myVeh.Position);
 
-                // BUG FIX: the relationship-hate check was flagging nearly
-                // every aircraft as hostile (default civilian relationship
-                // groups apparently weren't reading as expected), which is
-                // why every plane showed red. Hostility now comes ONLY from
-                // an actual combat flag against the player, or a confirmed
-                // military response vehicle model at high wanted level -
-                // both far more reliable signals.
+                // Hostile comes from: an actual combat flag, a confirmed
+                // military response model at high wanted level, OR a police
+                // pilot while you're wanted - a pursuing cop heli never
+                // trips IS_PED_IN_COMBAT (it just tracks/follows, doesn't
+                // "attack" in the combat sense) and isn't armed, but it's
+                // still actively chasing you and should read as a threat,
+                // not a neutral green aircraft.
                 bool inCombat = Function.Call<bool>(Hash.IS_PED_IN_COMBAT, driver, playerPed);
                 VehicleHash vh = (VehicleHash)v.Model.Hash;
                 bool isMilitaryModel = vh == VehicleHash.Hunter || vh == VehicleHash.Lazer || vh == VehicleHash.Besra || vh == VehicleHash.Savage;
-                bool hostile = inCombat || (isMilitaryModel && Function.Call<int>(Hash.GET_PLAYER_WANTED_LEVEL, Game.Player) >= 3);
+                int wantedLevel = Function.Call<int>(Hash.GET_PLAYER_WANTED_LEVEL, Game.Player);
+                bool isPursuingCop = Function.Call<bool>(Hash.IS_PED_A_COP, driver) && wantedLevel >= 1;
+                bool hostile = inCombat || (isMilitaryModel && wantedLevel >= 3) || isPursuingCop;
 
                 if (!hostile)
                 {
@@ -1423,30 +1635,28 @@ namespace SaifFuelMod
                     continue;
                 }
 
-                // real native homing-lock state on the ENEMY aircraft itself -
-                // this is the ONLY thing that turns the blip orange, since
-                // it's a real lock. Non-homing/cannon aircraft can't produce
-                // this state, so they correctly never show as "locked".
+                // Real native homing-lock state is tied to the player's own
+                // weapon-lock UI and doesn't reliably report anything for
+                // AI-driven aircraft - relying on it alone meant enemy
+                // missiles almost never fired. An AI aircraft that's close
+                // and lined up on you now counts as actively engaging too,
+                // so both homing and non-homing threats correctly show as a
+                // real threat and can trigger a simulated missile.
                 int lockState = Function.Call<int>(Hash.GET_VEHICLE_HOMING_LOCKON_STATE, v);
                 bool nativeLocked = lockState >= 2;
 
                 Vector3 toMe = (myVeh.Position - v.Position).Normalized;
                 float aim = Vector3.Dot(v.ForwardVector, toMe);
-                // fallback for cannon-only aircraft: lined up and close =
-                // genuine danger, but NOT a missile lock, so it stays red
-                // and triggers a separate "INCOMING FIRE" warning instead of
-                // the orange missile-lock indicator.
                 bool aimingAtMe = dist <= MISSILE_LOCK_RANGE && aim >= MISSILE_LOCK_CONE_DOT;
 
-                bool locking = nativeLocked;
+                bool locking = nativeLocked || aimingAtMe;
 
-                // flares suppress a real lock for a few seconds even if it
+                // flares suppress a lock for a few seconds even if it
                 // re-acquires immediately
                 if (_flareDetrackedUntil.TryGetValue(v.Handle, out DateTime until) && DateTime.Now < until)
                     locking = false;
 
                 if (locking) anyLock = true;
-                if (aimingAtMe && !locking) anyAiming = true;
 
                 seenHandles.Add(v.Handle);
                 SyncThreatBlip(v, locking, hostile: true);
@@ -1468,10 +1678,6 @@ namespace SaifFuelMod
                     _lastThreatBeep = DateTime.Now;
                     Function.Call(Hash.PLAY_SOUND_FRONTEND, -1, "5_SEC_WARNING", "MP_LEADERBOARD_SOUNDSET", false);
                 }
-            }
-            else if (anyAiming)
-            {
-                new TextElement("INCOMING FIRE", new PointF(Screen.Width / 2f - 100, 40), 0.45f, Color.Red, Font.ChaletComprimeCologne, GTA.UI.Alignment.Left, true, true).Draw();
             }
         }
 
@@ -1508,7 +1714,10 @@ namespace SaifFuelMod
         // expose the raw in-flight projectile entity, so the blip is
         // advanced manually - but it actively STEERS toward the nearest
         // locked hostile target every tick (proper homing curve), falling
-        // back to a straight flight path only if nothing is locked.
+        // back to a straight flight path only if nothing is locked. Either
+        // way the blip's position is updated every tick to the missile's
+        // real simulated position, so it's always visible on the map at its
+        // exact current location, homing or not.
         // =================================================================
         private class PlayerMissile { public Vector3 Position; public Vector3 Direction; public float LifeLeft; public Blip Blip; public int TargetHandle; }
         private readonly List<PlayerMissile> _playerMissiles = new List<PlayerMissile>();
@@ -1573,6 +1782,8 @@ namespace SaifFuelMod
                     float turnStep = PLAYER_MISSILE_TURN_RATE * Game.LastFrameTime;
                     m.Direction = Vector3.Lerp(m.Direction, toTarget, Math.Min(1f, turnStep)).Normalized;
                 }
+                // no target -> keeps flying straight in m.Direction - it
+                // still stays visible on the map at its real position below.
 
                 m.Position += m.Direction * PLAYER_MISSILE_SPEED * Game.LastFrameTime;
                 m.LifeLeft -= Game.LastFrameTime;
@@ -1598,17 +1809,20 @@ namespace SaifFuelMod
 
         // =================================================================
         // ENEMY MISSILE SIMULATION - GTA doesn't expose enemy-fired
-        // projectile entities either, so once a hostile aircraft's native
-        // homing lock (GET_VEHICLE_HOMING_LOCKON_STATE) has held for ~1.2s
-        // straight (long enough that a real pilot would have fired), a
-        // simulated enemy missile is spawned that homes in on the player -
-        // shown as a red blip on the main map, symmetric to "Your Missile".
+        // projectile entities either, so once a hostile aircraft has held a
+        // genuine engagement (real native lock OR sustained nose-on aim -
+        // see "locking" above) for long enough, a simulated enemy missile
+        // spawns and homes in on the player - shown as a real red blip on
+        // the map at its exact position every tick, symmetric to "Your
+        // Missile". A per-source cooldown lets the same hostile fire again
+        // if it keeps the lock, instead of only ever firing once.
         // =================================================================
         private class EnemyMissile { public Vector3 Position; public Vector3 Direction; public float LifeLeft; public Blip Blip; public int SourceHandle; }
         private readonly List<EnemyMissile> _enemyMissiles = new List<EnemyMissile>();
         private readonly Dictionary<int, float> _lockHoldSeconds = new Dictionary<int, float>();
-        private readonly HashSet<int> _alreadyFiredAt = new HashSet<int>();
+        private readonly Dictionary<int, float> _fireCooldown = new Dictionary<int, float>();
         private const float ENEMY_FIRE_LOCK_HOLD = 1.2f;
+        private const float ENEMY_FIRE_COOLDOWN = 3.5f;
         private const float ENEMY_MISSILE_SPEED = 260f;
         private const float ENEMY_MISSILE_LIFETIME = 7f;
         private const float ENEMY_MISSILE_TURN_RATE = 3.0f;
@@ -1628,7 +1842,10 @@ namespace SaifFuelMod
                         held += Game.LastFrameTime;
                         _lockHoldSeconds[handle] = held;
 
-                        if (held >= ENEMY_FIRE_LOCK_HOLD && !_alreadyFiredAt.Contains(handle))
+                        _fireCooldown.TryGetValue(handle, out float cooldown);
+                        cooldown -= Game.LastFrameTime;
+
+                        if (held >= ENEMY_FIRE_LOCK_HOLD && cooldown <= 0f)
                         {
                             var src = Entity.FromHandle(handle);
                             if (src != null && src.Exists())
@@ -1647,21 +1864,22 @@ namespace SaifFuelMod
                                 em.Blip.Name = "Enemy Missile";
                                 em.Blip.IsFlashing = true;
                                 _enemyMissiles.Add(em);
-                                _alreadyFiredAt.Add(handle);
+                                cooldown = ENEMY_FIRE_COOLDOWN; // can fire again after this, as long as it's still locking
                             }
                         }
+                        _fireCooldown[handle] = cooldown;
                     }
                     else
                     {
                         _lockHoldSeconds[handle] = 0f;
-                        _alreadyFiredAt.Remove(handle);
+                        _fireCooldown[handle] = 0f;
                     }
                 }
             }
             else
             {
                 _lockHoldSeconds.Clear();
-                _alreadyFiredAt.Clear();
+                _fireCooldown.Clear();
             }
 
             for (int i = _enemyMissiles.Count - 1; i >= 0; i--)
@@ -1873,6 +2091,10 @@ namespace SaifFuelMod
                                     _priceDiesel = float.Parse(parts[3]);
                                     if (parts.Length >= 5) _pricePremium = float.Parse(parts[4]);
                                     if (parts.Length >= 6) _deliveryCost = (int)float.Parse(parts[5]);
+                                    // BUG FIX: persist the auto-waypoint checkbox
+                                    // too, so it isn't silently reset to the
+                                    // default every time the mod reloads.
+                                    if (parts.Length >= 7) _autoWaypointEnabled = parts[6] == "1";
                                 }
                                 break;
                             }
@@ -1916,7 +2138,7 @@ namespace SaifFuelMod
                 lines.Add(string.Join("|",
                     _fuelConsumeRate.ToString("F2"), _refuelSpeed.ToString("F1"),
                     _priceRegular.ToString("F2"), _priceDiesel.ToString("F2"), _pricePremium.ToString("F2"),
-                    _deliveryCost.ToString()));
+                    _deliveryCost.ToString(), _autoWaypointEnabled ? "1" : "0"));
 
                 lines.Add("[HUD]");
                 lines.Add($"{_hudOffsetX:F0}|{_hudOffsetY:F0}|{_hudScale:F1}");
@@ -1988,7 +2210,10 @@ namespace SaifFuelMod
                 if (_settingsMenu.Visible || _serviceMenu.Visible) return; // let LemonUI handle nav keys
 
                 if (e.KeyCode == Keys.X) ToggleRadio();
-                else if (e.KeyCode == Keys.H) TryCallDelivery();
+                // CRASH FIX: no longer calls TryCallDelivery() directly here -
+                // just flags the request, OnTick executes it next frame in a
+                // yield-safe context. See the OnTick comment for why.
+                else if (e.KeyCode == Keys.H) _deliveryRequested = true;
             }
             catch (Exception ex) { Log("OnKeyDown error: " + ex.Message); }
         }
